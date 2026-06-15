@@ -2,7 +2,10 @@ import { Readable } from "node:stream";
 
 import { handleAdmin } from "./admin.mjs";
 import {
+  logRaw,
   logRequest,
+  recordRouteUpstreamError,
+  recordUpstreamError,
   resolveBoundRoute,
 } from "./route-utils.mjs";
 
@@ -21,13 +24,24 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const RETRYABLE_TRANSPORT_STATUS = new Set([502, 503, 504]);
 const DEFAULT_MAX_BODY_SIZE = 50 * 1024 * 1024;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 120_000;
-const DEFAULT_MAX_RETRIES = 3;
-const RATE_LIMIT_RETRY_DELAY_MS = 5_000;
+// 普通重试预算（fetch error / 502/503/504）独立计数：V5.1 §5.1
+const DEFAULT_GENERIC_MAX_RETRIES = 3;
+// 429 重试预算独立计数：V5.1 §5.1
 const RATE_LIMIT_MAX_RETRIES = 10;
+const RATE_LIMIT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_RETRY_BASE_MS = 1000;
+
+export class GatewayHttpError extends Error {
+  constructor(statusCode, type, message) {
+    super(message);
+    this.name = "GatewayHttpError";
+    this.statusCode = statusCode;
+    this.type = type;
+  }
+}
 
 function trimTrailingSlash(value) {
   return String(value ?? "").replace(/\/+$/, "");
@@ -60,10 +74,29 @@ function getRetryAfterMs(response) {
   return null;
 }
 
-export async function fetchWithRetry(url, options, maxRetries = DEFAULT_MAX_RETRIES) {
-  let lastError;
+// V5.1 §5.1：双计数器状态机，429 与普通重试预算彻底解耦。
+// - genericRetryCount : fetch error / 502 / 503 / 504，最多 DEFAULT_GENERIC_MAX_RETRIES(3) 次
+// - rateLimitRetryCount : 429 专用，最多 RATE_LIMIT_MAX_RETRIES(10) 次
+// - 终态 429 原样返回，绝不包装成 500
+// - 终态 4xx/5xx 由调用方负责 recordRouteUpstreamError 记录（fetchWithRetry 只看 5xx 终态兜底）
+// - route 是可选上下文：调用方拿到 response 后再做 route-aware 记录
+//
+// 返回值:最终 response（可能是终态 4xx/5xx/429），不再 throw fetch 错误（由调用方感知）。
+// 真正 fetch 失败时抛 lastError。
+export async function fetchWithRetry(url, options, route = null) {
+  let lastError = null;
+  let genericRetryCount = 0;
+  let rateLimitRetryCount = 0;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+  // 防御性兜底：while(true) 里若代码出 bug 也得能跳出
+  const hardCap = DEFAULT_GENERIC_MAX_RETRIES + RATE_LIMIT_MAX_RETRIES + 50;
+
+  while (genericRetryCount < DEFAULT_GENERIC_MAX_RETRIES
+      || rateLimitRetryCount < RATE_LIMIT_MAX_RETRIES) {
+    if (genericRetryCount + rateLimitRetryCount >= hardCap) {
+      break;
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DEFAULT_UPSTREAM_TIMEOUT_MS);
 
@@ -74,57 +107,76 @@ export async function fetchWithRetry(url, options, maxRetries = DEFAULT_MAX_RETR
       clearTimeout(timeout);
       lastError = error;
 
-      if (attempt < maxRetries) {
-        const delay = DEFAULT_RETRY_BASE_MS * Math.pow(2, attempt) + Math.random() * 500;
-        console.warn(
-          `[retry] attempt ${attempt + 1}/${maxRetries} fetch error: ${error.message}, retrying in ${Math.round(delay)}ms`,
+      if (genericRetryCount < DEFAULT_GENERIC_MAX_RETRIES) {
+        genericRetryCount += 1;
+        const delay = DEFAULT_RETRY_BASE_MS * Math.pow(2, genericRetryCount - 1) + Math.random() * 500;
+        logRaw(
+          `[warn][retry] generic ${genericRetryCount}/${DEFAULT_GENERIC_MAX_RETRIES} fetch error: ${error.message}, retrying in ${Math.round(delay)}ms`,
         );
         await sleep(delay);
         continue;
       }
 
-      throw lastError;
+      // 普通重试耗尽：交给调用方抛错并 recordRouteUpstreamError
+      recordRouteUpstreamError(route, { kind: "upstream-fetch", summary: error.message });
+      throw error;
     }
 
     clearTimeout(timeout);
 
-    if (!RETRYABLE_STATUS.has(response.status)) {
-      return response;
-    }
-
-    try {
-      await response.arrayBuffer();
-    } catch {
-      // ignore
-    }
-
+    // 429 走专用分支
     if (response.status === 429) {
-      if (attempt >= RATE_LIMIT_MAX_RETRIES) {
-        console.warn(`[retry] 429 exhausted ${RATE_LIMIT_MAX_RETRIES} retries, giving up`);
+      if (rateLimitRetryCount >= RATE_LIMIT_MAX_RETRIES) {
+        // 429 耗尽：原样返回 response，body 必须保持未消费，由 handleProxy 转给客户端。
+        // ⚠️ V5.2 §5.2：绝不能 await response.arrayBuffer() / response.text() 等会消耗 body 的方法。
+        // 任何 retry 路径上要丢弃的 response 才能 drain。
+        logRaw(`[warn][retry] 429 exhausted ${RATE_LIMIT_MAX_RETRIES} retries, returning 429`);
+        recordRouteUpstreamError(route, {
+          kind: "rate-limited",
+          status: 429,
+          summary: `429 exhausted ${RATE_LIMIT_MAX_RETRIES} retries`,
+        });
         return response;
       }
 
+      rateLimitRetryCount += 1;
       const delay = getRetryAfterMs(response) ?? RATE_LIMIT_RETRY_DELAY_MS;
-      console.warn(
-        `[retry] 429 rate limited, attempt ${attempt + 1}/${RATE_LIMIT_MAX_RETRIES}, waiting ${Math.round(delay)}ms`,
+      logRaw(
+        `[warn][retry] 429 rate limited, attempt ${rateLimitRetryCount}/${RATE_LIMIT_MAX_RETRIES}, waiting ${Math.round(delay)}ms`,
+      );
+      // 429 进度更新也记：CLI footer 在 60s 窗口内能体现进度
+      recordRouteUpstreamError(route, {
+        kind: "rate-limited",
+        status: 429,
+        summary: `429 attempt ${rateLimitRetryCount}/${RATE_LIMIT_MAX_RETRIES}`,
+      });
+      await sleep(delay);
+      continue;
+    }
+
+    // 502/503/504 走 generic 预算
+    if (RETRYABLE_TRANSPORT_STATUS.has(response.status)) {
+      if (genericRetryCount >= DEFAULT_GENERIC_MAX_RETRIES) {
+        // 5xx 终态：原样返回，由调用方 recordRouteUpstreamError
+        return response;
+      }
+      genericRetryCount += 1;
+      try { await response.arrayBuffer(); } catch { /* ignore */ }
+      const baseDelay = DEFAULT_RETRY_BASE_MS * Math.pow(2, genericRetryCount - 1);
+      const delay = baseDelay + Math.random() * 500;
+      logRaw(
+        `[warn][retry] generic ${genericRetryCount}/${DEFAULT_GENERIC_MAX_RETRIES} upstream ${response.status}, retrying in ${Math.round(delay)}ms`,
       );
       await sleep(delay);
       continue;
     }
 
-    if (attempt >= maxRetries) {
-      return response;
-    }
-
-    const baseDelay = DEFAULT_RETRY_BASE_MS * Math.pow(2, attempt);
-    const delay = baseDelay + Math.random() * 500;
-    console.warn(
-      `[retry] attempt ${attempt + 1}/${maxRetries} upstream ${response.status}, retrying in ${Math.round(delay)}ms`,
-    );
-    await sleep(delay);
+    // 2xx 或其他不可重试状态：直接返回
+    return response;
   }
 
-  throw lastError ?? new Error("fetchWithRetry exhausted retries");
+  // 正常路径不会到这里，兜底抛错
+  throw lastError ?? new Error("fetchWithRetry exhausted all budgets");
 }
 
 function detectModelFamily(requestedModel) {
@@ -224,7 +276,7 @@ async function readJsonBody(req, maxSize = DEFAULT_MAX_BODY_SIZE) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     totalSize += buf.length;
     if (totalSize > maxSize) {
-      throw new Error(`Request body exceeds ${maxSize} byte limit`);
+      throw new GatewayHttpError(413, "invalid_request_error", `Request body exceeds ${maxSize} byte limit`);
     }
     chunks.push(buf);
   }
@@ -238,7 +290,7 @@ async function readJsonBody(req, maxSize = DEFAULT_MAX_BODY_SIZE) {
     return JSON.parse(raw);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON body: ${message}`);
+    throw new GatewayHttpError(400, "invalid_request_error", `Invalid JSON body: ${message}`);
   }
 }
 
@@ -360,15 +412,35 @@ async function handleProxy(config, metrics, req, res, pathname) {
       method: "POST",
       headers: copyRequestHeaders(req, route.providerConfig, route.key),
       body: upstreamBody,
-    });
+    }, route);
   } catch (error) {
     recordMetric(metrics, route.modelFamily, true);
+    // fetch 耗尽：errorBus 已经在 fetchWithRetry 内部 recordRouteUpstreamError（带 family/providerId），
+    // 这里只需重新抛出去让顶层 catch 转 500。
     const message = error instanceof Error ? error.message : String(error);
     const cause =
       error && typeof error === "object" && "cause" in error ? String(error.cause) : "unknown";
     throw new Error(
       `Upstream fetch failed for ${route.providerId}:${route.upstreamModel} ${pathname}: ${message}; cause=${cause}`,
     );
+  }
+
+  // 终态 4xx/5xx 纳入 footer 可见性模型（V5.1 §5.4 / V5.2 §5.3）
+  // 429 已经在 fetchWithRetry 内部记成 rate-limited，这里不要再覆盖成 api-error。
+  if (upstreamResponse.status === 429) {
+    // 不重复记录：fetchWithRetry 已经把 429 终态记为 rate-limited
+  } else if (upstreamResponse.status >= 500) {
+    recordRouteUpstreamError(route, {
+      kind: "upstream-5xx",
+      status: upstreamResponse.status,
+      summary: `${route.providerId}:${route.upstreamModel} ${pathname} -> ${upstreamResponse.status}`,
+    });
+  } else if (upstreamResponse.status >= 400) {
+    recordRouteUpstreamError(route, {
+      kind: "api-error",
+      status: upstreamResponse.status,
+      summary: `${route.providerId}:${route.upstreamModel} ${pathname} -> ${upstreamResponse.status}`,
+    });
   }
 
   res.statusCode = upstreamResponse.status;
@@ -384,7 +456,13 @@ async function handleProxy(config, metrics, req, res, pathname) {
   const stream = Readable.fromWeb(upstreamResponse.body);
   stream.on("error", (error) => {
     recordMetric(metrics, route.modelFamily, true);
-    console.error(`[stream-error] ${route.providerId}:${route.upstreamModel} ${pathname}: ${error.message}`);
+    logRaw(`[error][stream-error] ${route.providerId}:${route.upstreamModel} ${pathname}: ${error.message}`);
+    recordUpstreamError({
+      family: route.modelFamily,
+      providerId: route.providerId,
+      kind: "stream-error",
+      summary: error.message,
+    });
     if (!res.writableEnded) {
       res.end();
     }
@@ -459,8 +537,20 @@ export function createGatewayRequestHandler(config, metrics, ctx = {}) {
         },
       });
     } catch (error) {
+      // 本地输入错误：尊重 typed statusCode/Type，直接返回 4xx
+      if (error instanceof GatewayHttpError) {
+        if (!res.headersSent) {
+          writeJson(res, error.statusCode, {
+            error: {
+              type: error.type,
+              message: error.message,
+            },
+          });
+        }
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[gateway-error] ${message}`);
+      logRaw(`[error][gateway-error] ${message}`);
       if (!res.headersSent) {
         writeJson(res, 500, {
           error: {

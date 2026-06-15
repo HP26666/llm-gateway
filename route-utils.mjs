@@ -1,11 +1,57 @@
 export const FAMILY_ORDER = ["opus", "sonnet", "sonnet[1m]", "haiku"];
 
+import { EventEmitter } from "node:events";
+
 const LOG_BUFFER_LIMIT = 200;
 const logBuffer = [];
 
 // CLI 模式下打开：gateway 处理请求时的 logRequest 等只 buffer，不再 console.log
 // 抢屏主界面。CLI 按下 8 实时日志视图仍能从 getRecentLogs 看到全部日志。
 let suppressConsole = false;
+
+// 上游异常事件总线 + 最近一次错误快照。
+// gateway 后台处理请求时遇到 fetch error / 429 / stream-error 调用 recordUpstreamError，
+// CLI 主循环监听 errorBus，下次重绘 statusLine 时显示。同进程共享内存，无新依赖。
+export const errorBus = new EventEmitter();
+// 避免 listener 不够时 Node 11 警告——CLI 是唯一消费者，但留余量
+errorBus.setMaxListeners(20);
+let lastUpstreamError = null;
+
+// 上游异常原因分类（参考 V5.1 §5.4）。
+// upstream-fetch  : DNS/connect/timeout/transport failure
+// rate-limited    : 429（含进度更新与终态）
+// api-error       : 终态 4xx（401/403/404 等）
+// upstream-5xx    : 终态 5xx
+// stream-error    : 上游流中断
+export function recordUpstreamError({ family, kind, summary, providerId, status } = {}) {
+  lastUpstreamError = {
+    ts: Date.now(),
+    family: family ?? null,
+    kind: kind ?? "unknown",
+    summary: summary ?? "",
+    providerId: providerId ?? null,
+    status: status ?? null,
+  };
+  errorBus.emit("upstream-error", lastUpstreamError);
+}
+
+// route-aware 助手：避免在 server.mjs 多个 catch 里反复拼字段。
+// route 可以是 null（fetchWithRetry 拿不到完整 route 时）。
+export function recordRouteUpstreamError(route, { kind, summary, status } = {}) {
+  recordUpstreamError({
+    family: route?.modelFamily ?? null,
+    providerId: route?.providerId ?? null,
+    kind,
+    summary,
+    status,
+  });
+}
+
+export function getLastUpstreamError(maxAgeMs = 60000) {
+  if (!lastUpstreamError) return null;
+  if (Date.now() - lastUpstreamError.ts > maxAgeMs) return null;
+  return lastUpstreamError;
+}
 
 export function setSuppressConsole(v) {
   suppressConsole = !!v;

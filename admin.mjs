@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { saveConfig, shortId } from "./config.mjs";
+import { saveConfig as defaultSaveConfig, shortId } from "./config.mjs";
 import {
   describeBinding,
   findProviderBaseUrl,
@@ -12,11 +12,20 @@ import {
   logModelChange,
   logPortChange,
   logProviderChange,
+  logRaw,
 } from "./route-utils.mjs";
 import { checkPortFree, findPortOccupant, isValidPort, killProcess } from "./port-utils.mjs";
 
 const DEFAULT_MAX_BODY_SIZE = 50 * 1024 * 1024;
 const MAX_HISTORY_ITEMS = 200;
+
+// V5.2 §5.4: 端口切换成功路径单次持久化测试需要观察 saveConfig 调用次数。
+// 默认走 config.mjs 的真实 saveConfig；测试可通过 __setSaveConfigForTest 注入 spy。
+// 注入仅在测试期间使用，生产代码不会改这个绑定。
+let saveConfig = defaultSaveConfig;
+export function __setSaveConfigForTest(fn) {
+  saveConfig = typeof fn === "function" ? fn : defaultSaveConfig;
+}
 
 class HttpError extends Error {
   constructor(statusCode, message, details) {
@@ -657,22 +666,106 @@ async function handleChangePort(config, runtime, req, res) {
     }
   }
 
-  // 事务式：先 await 重绑成功，再落盘 + 返回成功。
-  // 重绑失败时旧端口仍在工作，config 不变，调用方收到 500。
-  if (!runtime?.restartOnPort) {
+  // V5.1 §5.3：两阶段事务
+  // 1) prepare：新端口起 candidate，旧端口仍服务
+  // 2) 改 in-memory config.gateway.port
+  // 3) saveConfig 落盘
+  // 4) commit：推进 active server + 更新 currentPort
+  // 任一阶段失败 → rollback config + rollback tx + 500 + details
+  if (!runtime?.preparePortSwitch) {
     throw new HttpError(500, "runtime not available");
   }
-  let switchResult;
-  try {
-    switchResult = await runtime.restartOnPort(port);
-  } catch (err) {
-    throw new HttpError(500, `failed to switch port: ${err.message}`, { port, host });
+  if (runtime.isSwitchInFlight && runtime.isSwitchInFlight()) {
+    throw new HttpError(409, "port switch already in progress");
   }
 
-  await persist(config, 200, { ok: true, port, changed: switchResult.changed, previous }, res);
-  if (switchResult.changed) {
-    logPortChange({ from: previous, to: port, source });
+  let tx;
+  try {
+    tx = await runtime.preparePortSwitch(port, { excludeSocket: req.socket });
+  } catch (err) {
+    throw new HttpError(500, `failed to prepare port switch: ${err.message}`, { port, host });
   }
+
+  if (tx.noop) {
+    await persist(config, 200, { ok: true, port, changed: false, previous }, res);
+    return;
+  }
+
+  // prepare 成功：candidate 已经在新端口跑。config 也得跟上。
+  // 顺序：先改内存 config，再 saveConfig，最后 commit。
+  const previousConfigPort = config.gateway.port;
+  config.gateway.port = port;
+
+  let saveError = null;
+  try {
+    await saveConfig(config);
+  } catch (err) {
+    saveError = err;
+  }
+
+  if (saveError) {
+    // 落盘失败：把内存 config 回滚到旧端口，tx rollback
+    config.gateway.port = previousConfigPort;
+    let rollbackError = null;
+    try {
+      await tx.rollback();
+    } catch (err) {
+      rollbackError = err;
+    }
+    throw new HttpError(
+      500,
+      "port switch rolled back; previous port still active",
+      {
+        runtimePort: port,
+        persistedPort: previousConfigPort,
+        saveError: saveError.message,
+        rollbackError: rollbackError?.message,
+      },
+    );
+  }
+
+  // saveConfig 成功：commit
+  let commitError = null;
+  try {
+    await tx.commit();
+  } catch (err) {
+    commitError = err;
+  }
+
+  if (commitError) {
+    // 补偿：尝试把 config 恢复到旧端口并再次 saveConfig
+    config.gateway.port = previousConfigPort;
+    let configRollbackError = null;
+    try {
+      await saveConfig(config);
+    } catch (err) {
+      configRollbackError = err;
+    }
+    // 同时也回滚事务（如果 commit 完全没执行）
+    let txRollbackError = null;
+    try {
+      await tx.rollback();
+    } catch (err) {
+      txRollbackError = err;
+    }
+    throw new HttpError(
+      500,
+      "port commit failed; attempted rollback",
+      {
+        runtimePort: port,
+        persistedPort: previousConfigPort,
+        commitError: commitError.message,
+        configRollbackError: configRollbackError?.message,
+        txRollbackError: txRollbackError?.message,
+      },
+    );
+  }
+
+  // V5.2 §5.4：成功路径只持久化一次。
+  // prepare 之前没有持久化；prepare -> saveConfig(第一次) -> commit。
+  // 这里直接 writeJson，不再调 persist()（persist 内部会再 saveConfig 一次）。
+  writeJson(res, 200, { ok: true, port, changed: true, previous });
+  logPortChange({ from: previous, to: port, source });
 }
 
 function decodeAdminSegments(pathname) {
@@ -811,7 +904,7 @@ export async function handleAdmin({ config, metrics, req, res, pathname, runtime
     const details = error instanceof HttpError ? error.details : undefined;
 
     if (statusCode >= 500) {
-      console.error(`[admin-error] ${message}`);
+      logRaw(`[error][admin-error] ${message}`);
     }
 
     writeJson(res, statusCode, {

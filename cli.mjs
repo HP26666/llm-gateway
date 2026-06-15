@@ -3,7 +3,7 @@ import { writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { FAMILY_ORDER, getRecentLogs, setSuppressConsole } from "./route-utils.mjs";
+import { FAMILY_ORDER, getLastUpstreamError, getRecentLogs, setSuppressConsole } from "./route-utils.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,6 +14,31 @@ const DEFAULT_WIDTH = 80;
 const MIN_WIDTH = 60;
 // box 总宽上限：终端再宽也不超过 100 列，避免窄屏被拉得太宽。
 const MAX_WIDTH = 100;
+
+// V5.1 §5.2：footer 状态纯函数，60s 新鲜度窗口，每次重绘都基于状态快照计算。
+// 优先级:无法连接网关 > 上游异常 > CLI 操作结果 > 就绪
+export function computeStatusLine({
+  configError,
+  upstreamError,
+  lastOpResult,
+  lastOpError,
+}) {
+  if (configError) {
+    return `! 无法连接网关: ${configError}`;
+  }
+  if (upstreamError) {
+    const familyTag = upstreamError.family ? `[${upstreamError.family}]` : "";
+    const statusBit = upstreamError.status ? ` ${upstreamError.status}` : "";
+    return `! 上游异常${familyTag} ${upstreamError.kind}${statusBit}: ${upstreamError.summary}`;
+  }
+  if (lastOpResult === "error") {
+    return `状态: 上次操作失败（${lastOpError || "请按 8 查看日志"}）`;
+  }
+  if (lastOpResult === "ok") {
+    return "状态: 上次操作成功";
+  }
+  return "状态: 就绪";
+}
 
 let gatewayUrl = "http://127.0.0.1:8000";
 
@@ -39,14 +64,22 @@ async function api(path, options = {}) {
   }
 
   let response;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
   try {
-    response = await fetch(`${getGatewayUrl()}/admin${path}`, init);
+    response = await fetch(`${getGatewayUrl()}/admin${path}`, { ...init, signal: controller.signal });
   } catch (error) {
-    const wrapped = new Error(`无法连接到网关 ${getGatewayUrl()}: ${error.message}`);
+    clearTimeout(timer);
+    const isTimeout = error?.name === "TimeoutError" || error?.name === "AbortError";
+    const msg = isTimeout
+      ? `请求超时(30s): ${path}`
+      : `无法连接到网关 ${getGatewayUrl()}: ${error.message}`;
+    const wrapped = new Error(msg);
     wrapped.payload = { error: { message: wrapped.message } };
-    wrapped.status = 0;
+    wrapped.status = isTimeout ? 408 : 0;
     throw wrapped;
   }
+  clearTimeout(timer);
   const text = await response.text();
   let data = {};
   if (text) {
@@ -868,14 +901,25 @@ async function changePortFlow(ask, pushLog, runtime) {
     }
   }
 
-  // 事务式 PATCH：内部先 await runtime.restartOnPort，失败会抛错且旧端口保留工作。
+  // V5.1 §5.3：事务式 PATCH。失败时如果服务端带 details 透出当前 runtimePort/persistedPort，
+  // 明确打印帮助用户判断"实际监听在哪个端口"。
   try {
     await api("/runtime/port", {
       method: "PATCH",
       body: { port, killIfOccupied: !probe.free },
     });
   } catch (err) {
-    throw new Error(`切换端口失败（旧端口仍可用）: ${err.message}`);
+    const details = err?.payload?.error?.details;
+    let extra = "";
+    if (details && typeof details === "object") {
+      const bits = [];
+      if (details.runtimePort) bits.push(`runtimePort=${details.runtimePort}`);
+      if (details.persistedPort) bits.push(`persistedPort=${details.persistedPort}`);
+      if (details.saveError) bits.push(`saveError=${details.saveError}`);
+      if (details.commitError) bits.push(`commitError=${details.commitError}`);
+      if (bits.length) extra = ` [${bits.join(", ")}]`;
+    }
+    throw new Error(`切换端口失败（旧端口仍可用）: ${err.message}${extra}`);
   }
 
   if (runtime) {
@@ -964,6 +1008,9 @@ export async function startCli({ config, runtime }) {
   let running = true;
   let lastOpResult = null; // null=就绪 / "ok" / "error"
   let lastOpError = null;
+  // V5.1 §5.2：UI 渲染不依赖 errorBus；事件总线保留以备未来扩展。
+  // footer 直接读 getLastUpstreamError(60000) 状态快照，60s 窗口过期自然回落。
+  // 不主动重绘（避免 ask() 抢屏），等用户按下一个键自然刷新。
 
   while (running) {
     let liveConfig;
@@ -975,17 +1022,15 @@ export async function startCli({ config, runtime }) {
       configError = err.message;
     }
 
-    // 主界面默认不显示日志内容，仅显示中性状态；连接错误优先展示
-    let statusLine;
-    if (configError) {
-      statusLine = `! 无法连接网关: ${configError}`;
-    } else if (lastOpResult === "error") {
-      statusLine = `状态: 上次操作失败（${lastOpError || "请按 8 查看日志"}）`;
-    } else if (lastOpResult === "ok") {
-      statusLine = "状态: 上次操作成功";
-    } else {
-      statusLine = "状态: 就绪";
-    }
+    // 状态快照：每次重绘都直接读 60s 窗口内的最近一次上游异常。
+    const upstreamError = getLastUpstreamError(60000);
+
+    const statusLine = computeStatusLine({
+      configError,
+      upstreamError,
+      lastOpResult,
+      lastOpError,
+    });
 
     renderHome({
       config: liveConfig,
