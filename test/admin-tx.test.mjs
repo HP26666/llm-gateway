@@ -39,8 +39,12 @@ test("V5.2 admin 端口切换成功路径只持久化 1 次", async (t) => {
   const config = makeConfig(port);
   const metrics = {};
 
-  // 占位 handler 不会被调用（admin endpoint 走的是同一个 createGatewayRequestHandler 实例）
-  const placeholderHandler = () => {};
+  // runtime server 的 handler：V5.3 回环探测会 fetch /health，handler 必须能响应（任意 200 即可）。
+  // admin endpoint 实际走 createGatewayRequestHandler 实例，不依赖这个 handler 的业务逻辑。
+  const placeholderHandler = (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  };
 
   const runtime = createGatewayRuntime({
     config,

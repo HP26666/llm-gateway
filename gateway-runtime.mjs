@@ -1,5 +1,26 @@
 import http from "node:http";
 
+// V5.3 回环探测：listen 成功后用一次真实 HTTP 请求确认端口能真正接受连接。
+// 背景：Windows 某些系统保留端口（Hyper-V/WSL2/Docker 动态保留端口）会让
+// server.listen 报告成功、listening=true，甚至 TCP connect 也成功，但操作系统
+// 在底层接管后不会把 HTTP 流量交给我们的 server（fetch 直接 failed）。只靠 listen
+// 的返回值不足以判断端口可用，必须在 prepare 阶段做一次 HTTP 回环验证。
+// ⚠️ 必须用 HTTP 探测而非裸 TCP：保留端口的 TCP 三次握手是成功的，只有 HTTP 层会失败。
+export async function loopbackProbePort(host, port, timeoutMs = 2000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(`http://${host}:${port}/health`, { signal: controller.signal });
+    // 收到任意 HTTP 响应（不关心状态码）即认为端口真正可用；drain body 释放连接
+    try { await resp.arrayBuffer(); } catch { /* ignore */ }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createGatewayRuntime({ config, requestHandler }) {
   let server = null;
   let currentHost = config.gateway.host;
@@ -144,6 +165,20 @@ export function createGatewayRuntime({ config, requestHandler }) {
       try { candidate.close(); } catch { /* ignore */ }
       trackedSockets.delete(candidate);
       throw new Error(`failed to listen on ${host}:${newPort}: ${message}`);
+    }
+
+    // V5.3 回环探测：listen 成功不代表端口真的能用。Windows 保留端口会 listen 假成功
+    // （见 loopbackProbePort 注释）。探测失败 → 回滚 candidate 并抛错，让 admin 返回 500，
+    // config.gateway.port 不被污染、旧端口继续服务。
+    const probeOk = await loopbackProbePort(host, newPort);
+    if (!probeOk) {
+      if (inflightSwitch === sentinel) inflightSwitch = null;
+      activeLock();
+      try { candidate.close(); } catch { /* ignore */ }
+      trackedSockets.delete(candidate);
+      throw new Error(
+        `port ${newPort} listen 成功但回环探测失败：该端口可能被系统保留（Windows Hyper-V/WSL/Docker 动态保留端口），请更换端口`,
+      );
     }
 
     let committed = false;

@@ -2,7 +2,8 @@
 // node:test 形式
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createGatewayRuntime } from "../gateway-runtime.mjs";
+import http from "node:http";
+import { createGatewayRuntime, loopbackProbePort } from "../gateway-runtime.mjs";
 
 function makeConfig(port) {
   return { gateway: { host: "127.0.0.1", port } };
@@ -127,4 +128,20 @@ test("并发锁 V5.2: 真正并发的两个 prepare，恰好 1 成功 1 失败",
     await winnerTx.commit();
   }
   assert.equal(runtime.isSwitchInFlight(), false, "lock must be released after commit");
+});
+
+// V5.3: 回环探测 loopbackProbePort 单元测试。
+// 端到端的"系统保留端口 listen 假成功"不可移植（仅在特定 Windows 机器的保留端口触发），
+// 这里覆盖 probe 函数本身的判定逻辑；preparePortSwitch 对 probe 失败端口的拒绝由 repro 脚本验证。
+test("loopbackProbePort: listen 中的端口探测成功", async (t) => {
+  const server = http.createServer((req, res) => { res.writeHead(200); res.end("ok"); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  t.after(() => new Promise((r) => server.close(r)));
+  assert.equal(await loopbackProbePort("127.0.0.1", port), true);
+});
+
+test("loopbackProbePort: 无人监听的端口探测失败", async () => {
+  // 端口 1 是特权端口、几乎不可能有监听，connect 必被拒 → probe 返回 false
+  assert.equal(await loopbackProbePort("127.0.0.1", 1), false);
 });
