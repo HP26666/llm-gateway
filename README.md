@@ -10,7 +10,7 @@
 llm-gateway/
 ├── main.mjs             # 唯一入口：端口冲突处理 → 启动 runtime → CLI
 ├── server.mjs           # 请求处理：/v1/messages 代理、/admin/* 内部 API、/health
-├── gateway-runtime.mjs  # HTTP 服务生命周期（start/stop/restartOnPort）
+├── gateway-runtime.mjs  # HTTP 服务生命周期（start/close/preparePortSwitch）
 ├── config.mjs           # data/gateway.json 加载/原子保存/v2→v3 迁移/BOM 容错
 ├── admin.mjs            # /admin/* 内部 API（仅 127.0.0.1，供 CLI/脚本调用）
 ├── route-utils.mjs      # 路由解析 + 终端日志缓存（emitLog/suppressConsole）
@@ -166,9 +166,12 @@ Claude gateway listening on http://127.0.0.1:8000 | families: opus->glm:glm-5.1,
 CLI 中执行任何配置变更（family 切换、端口切换等）**无需重启**：
 
 - family 切换：admin handler 直接修改共享 config 引用，下一次请求即生效
-- 端口切换（**事务式**）：先尝试在新端口 listen 新 server，成功后才关闭旧 server；失败时旧端口保留工作，配置文件不会被污染为新端口
-  - 实际流程：`runtime.restartOnPort(newPort)` await 完成后，admin 才 `saveConfig` 并返回 200
-  - 失败时 admin 返回 500，`config.gateway.port` 仍是旧值
+- 端口切换（**两阶段事务**，V5.1）：runtime 不再直接改 config
+  - 实际流程：admin 调 `runtime.preparePortSwitch(newPort, { excludeSocket })` → 改 in-memory `config.gateway.port` → `saveConfig()` 落盘 → `tx.commit()` 推进 active server → 返回 200
+  - 失败补偿：saveConfig 失败 → 回滚 in-memory port + `tx.rollback()` → 返回 500 + details
+  - commit 失败 → 尝试回滚 config（再次 saveConfig）+ `tx.rollback()` → 返回 500 + details
+  - 端口切换成功/失败后，admin 响应 200/500，runtime 与磁盘 config 始终一致
+  - 旧 PATCH 自占 socket 用 `excludeSocket` 排除，PATCH 响应能写回；旧 server 销毁走 socket tracking
 
 每次切换都会在终端和 `8=日志` 视图中留下 `[config-change]` 记录。
 

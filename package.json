@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Local Anthropic-compatible LLM gateway with single-entry CLI + gateway runtime.",
   "scripts": {
-    "start": "node main.mjs"
+    "start": "node main.mjs",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"

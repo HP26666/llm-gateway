@@ -3,6 +3,8 @@ import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { logRaw } from "./route-utils.mjs";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -309,8 +311,8 @@ function warnIfLegacyEnvExists() {
         return;
       }
       warnedLegacyEnv = true;
-      console.warn(
-        "[config] 检测到根目录 gateway.env，已废弃不再读取；请通过 CLI 维护配置。",
+      logRaw(
+        "[warn][config] 检测到根目录 gateway.env，已废弃不再读取；请通过 CLI 维护配置。",
       );
     })
     .catch(() => {
