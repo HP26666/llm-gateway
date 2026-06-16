@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { FAMILY_ORDER, getLastUpstreamError, getRecentLogs, setSuppressConsole } from "./route-utils.mjs";
+import { selectValue, fallbackPickOptionByNumber, CancelledError } from "./cli-select.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,6 +42,9 @@ export function computeStatusLine({
 }
 
 let gatewayUrl = "http://127.0.0.1:8000";
+
+// 由 startCli 创建 readline 后赋值，供 pickOption / 子菜单的 selectValue 复用方向键选择。
+let globalRl = null;
 
 function setGatewayUrl(url) {
   gatewayUrl = String(url || gatewayUrl);
@@ -308,26 +312,36 @@ function makeAsk(rl) {
     });
 }
 
+// 包装 ask 支持中途取消：输入 q（trim 后）抛 CancelledError。
+// keepBlank=true（默认，可留空字段）：空回车返回 ""；keepBlank=false（必填字段）：空回车也取消。
+// 用于 createProvider 等多步文本输入流程，让用户中途能退出而不必填完全部信息。
+async function askCancelable(ask, prompt, { keepBlank = true } = {}) {
+  const answer = (await ask(prompt)).trim();
+  if (answer.toLowerCase() === "q") {
+    throw new CancelledError();
+  }
+  if (!keepBlank && answer === "") {
+    throw new CancelledError();
+  }
+  return answer;
+}
+
 async function pickOption(ask, message, options) {
-  console.log(`\n${message}`);
   if (!options || options.length === 0) {
+    console.log(`\n${message}`);
     console.log("(无可用选项)");
     await ask("按回车返回... ");
     return null;
   }
-  options.forEach((option, index) => {
-    console.log(`  [${index + 1}] ${option.label}`);
+  // 方向键高亮选择（raw mode，单列：上下/左右移动选中、回车确认、Esc/q 取消、数字跳转高亮）。
+  // 非 TTY 或 LLM_CLI_NO_KEYSELECT=1 时 onFallback 走原数字模式。
+  // 对外签名 (ask, message, options) => value|null 不变：取消 -> null。
+  return selectValue(globalRl, message, options, {
+    layout: "single",
+    cancelOnEsc: true,
+    cancelOnQ: true,
+    onFallback: () => fallbackPickOptionByNumber(ask, message, options),
   });
-  const answer = await ask("> ");
-  const trimmed = answer.trim();
-  if (trimmed === "" || trimmed.toLowerCase() === "q") {
-    return null;
-  }
-  const idx = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(idx) || idx < 1 || idx > options.length) {
-    throw new Error("无效的选项");
-  }
-  return options[idx - 1].value;
 }
 
 function fetchProviders(config) {
@@ -349,17 +363,16 @@ async function pickProvider(ask, config, message = "选择 Provider：") {
 }
 
 async function createProviderFlow(ask, pushLog) {
-  const name = (await ask("\nProvider 名称（如 GLM、Kimi、DeepSeek）: ")).trim();
-  if (!name) throw new Error("已取消");
-  const baseUrl = (await ask("Base URL（可留空，稍后通过 2 添加）: ")).trim();
+  const name = await askCancelable(ask, "\nProvider 名称（如 GLM、Kimi、DeepSeek，q 取消）: ", { keepBlank: false });
+  const baseUrl = await askCancelable(ask, "Base URL（可留空，q 取消）: ", { keepBlank: true });
   let baseUrlNote = "";
   if (baseUrl) {
-    baseUrlNote = (await ask("Base URL 备注（可留空）: ")).trim();
+    baseUrlNote = await askCancelable(ask, "Base URL 备注（可留空，q 取消）: ", { keepBlank: true });
   }
-  const apiKey = (await ask("API Key（可留空）: ")).trim();
+  const apiKey = await askCancelable(ask, "API Key（可留空，q 取消）: ", { keepBlank: true });
   let keyNote = "";
   if (apiKey) {
-    keyNote = (await ask("API Key 备注（可留空）: ")).trim();
+    keyNote = await askCancelable(ask, "API Key 备注（可留空，q 取消）: ", { keepBlank: true });
   }
 
   const body = { name };
@@ -379,11 +392,10 @@ async function createProviderFlow(ask, pushLog) {
 async function addBaseUrlFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
 
-  const url = (await ask("\nBase URL: ")).trim();
-  if (!url) throw new Error("已取消");
-  const note = (await ask("备注（可留空）: ")).trim();
+  const url = await askCancelable(ask, "\nBase URL（q 取消）: ", { keepBlank: false });
+  const note = await askCancelable(ask, "备注（可留空，q 取消）: ", { keepBlank: true });
 
   const result = await api(`/providers/${encodeURIComponent(provider.id)}/baseUrls`, {
     method: "POST",
@@ -395,7 +407,7 @@ async function addBaseUrlFlow(ask, pushLog) {
 async function updateBaseUrlFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
   if (!provider.baseUrls?.length) throw new Error(`Provider ${provider.id} 没有 BaseUrl`);
 
   const baseUrl = await pickOption(
@@ -406,12 +418,12 @@ async function updateBaseUrlFlow(ask, pushLog) {
       value: b,
     })),
   );
-  if (!baseUrl) throw new Error("已取消");
+  if (!baseUrl) throw new CancelledError();
 
   console.log(`\n当前 URL: ${baseUrl.url}`);
   console.log(`当前备注: ${baseUrl.note || "(无)"}`);
-  const url = (await ask("新 URL（可留空保持不变）: ")).trim();
-  const note = (await ask("新备注（可留空保持不变）: ")).trim();
+  const url = await askCancelable(ask, "新 URL（可留空保持不变，q 取消）: ", { keepBlank: true });
+  const note = await askCancelable(ask, "新备注（可留空保持不变，q 取消）: ", { keepBlank: true });
 
   const body = {};
   if (url) body.url = url;
@@ -431,7 +443,7 @@ async function updateBaseUrlFlow(ask, pushLog) {
 async function deleteBaseUrlFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
   if (!provider.baseUrls?.length) throw new Error(`Provider ${provider.id} 没有 BaseUrl`);
 
   const baseUrl = await pickOption(
@@ -442,7 +454,7 @@ async function deleteBaseUrlFlow(ask, pushLog) {
       value: b,
     })),
   );
-  if (!baseUrl) throw new Error("已取消");
+  if (!baseUrl) throw new CancelledError();
 
   const confirm = (await ask(`\n确认删除 BaseUrl "${baseUrl.note || baseUrl.id}"? (y/N): `)).trim().toLowerCase();
   if (confirm !== "y") {
@@ -459,11 +471,10 @@ async function deleteBaseUrlFlow(ask, pushLog) {
 async function addKeyFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
 
-  const token = (await ask("\nAPI Token: ")).trim();
-  if (!token) throw new Error("已取消");
-  const note = (await ask("备注（可留空）: ")).trim();
+  const token = await askCancelable(ask, "\nAPI Token（q 取消）: ", { keepBlank: false });
+  const note = await askCancelable(ask, "备注（可留空，q 取消）: ", { keepBlank: true });
 
   await api(`/providers/${encodeURIComponent(provider.id)}/keys`, {
     method: "POST",
@@ -475,7 +486,7 @@ async function addKeyFlow(ask, pushLog) {
 async function updateKeyFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
   if (!provider.keys?.length) throw new Error(`Provider ${provider.id} 没有 Key`);
 
   const key = await pickOption(
@@ -486,11 +497,11 @@ async function updateKeyFlow(ask, pushLog) {
       value: k,
     })),
   );
-  if (!key) throw new Error("已取消");
+  if (!key) throw new CancelledError();
 
   console.log(`\n当前备注: ${key.note || "(无)"}`);
-  const token = (await ask("新 Token（可留空保持不变）: ")).trim();
-  const note = (await ask("新备注（可留空保持不变）: ")).trim();
+  const token = await askCancelable(ask, "新 Token（可留空保持不变，q 取消）: ", { keepBlank: true });
+  const note = await askCancelable(ask, "新备注（可留空保持不变，q 取消）: ", { keepBlank: true });
 
   const body = {};
   if (token) body.token = token;
@@ -510,7 +521,7 @@ async function updateKeyFlow(ask, pushLog) {
 async function deleteKeyFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
   if (!provider.keys?.length) throw new Error(`Provider ${provider.id} 没有 Key`);
 
   const key = await pickOption(
@@ -521,7 +532,7 @@ async function deleteKeyFlow(ask, pushLog) {
       value: k,
     })),
   );
-  if (!key) throw new Error("已取消");
+  if (!key) throw new CancelledError();
 
   const confirm = (await ask(`\n确认删除 Key "${key.note || key.id}"? (y/N): `)).trim().toLowerCase();
   if (confirm !== "y") {
@@ -538,11 +549,10 @@ async function deleteKeyFlow(ask, pushLog) {
 async function addModelFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
 
-  const modelValue = (await ask("\n上游 Model 型号（如 glm-5.1）: ")).trim();
-  if (!modelValue) throw new Error("已取消");
-  const nameValue = (await ask("显示名称（可留空，默认与型号相同）: ")).trim();
+  const modelValue = await askCancelable(ask, "\n上游 Model 型号（如 glm-5.1，q 取消）: ", { keepBlank: false });
+  const nameValue = await askCancelable(ask, "显示名称（可留空，默认与型号相同，q 取消）: ", { keepBlank: true });
 
   const result = await api(`/providers/${encodeURIComponent(provider.id)}/models`, {
     method: "POST",
@@ -554,7 +564,7 @@ async function addModelFlow(ask, pushLog) {
 async function updateModelFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
   if (!provider.models?.length) throw new Error(`Provider ${provider.id} 没有 Model`);
 
   const model = await pickOption(
@@ -568,12 +578,12 @@ async function updateModelFlow(ask, pushLog) {
       value: m,
     })),
   );
-  if (!model) throw new Error("已取消");
+  if (!model) throw new CancelledError();
 
   console.log(`\n当前型号: ${model.model}`);
   console.log(`当前名称: ${model.name}`);
-  const modelValue = (await ask("新型号（可留空保持不变）: ")).trim();
-  const nameValue = (await ask("新名称（可留空保持不变）: ")).trim();
+  const modelValue = await askCancelable(ask, "新型号（可留空保持不变，q 取消）: ", { keepBlank: true });
+  const nameValue = await askCancelable(ask, "新名称（可留空保持不变，q 取消）: ", { keepBlank: true });
 
   const body = {};
   if (modelValue) body.model = modelValue;
@@ -593,7 +603,7 @@ async function updateModelFlow(ask, pushLog) {
 async function deleteModelFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
   if (!provider.models?.length) throw new Error(`Provider ${provider.id} 没有 Model`);
 
   const model = await pickOption(
@@ -607,7 +617,7 @@ async function deleteModelFlow(ask, pushLog) {
       value: m,
     })),
   );
-  if (!model) throw new Error("已取消");
+  if (!model) throw new CancelledError();
 
   const confirm = (await ask(`\n确认删除 Model "${model.name}"? (y/N): `)).trim().toLowerCase();
   if (confirm !== "y") {
@@ -621,20 +631,54 @@ async function deleteModelFlow(ask, pushLog) {
   pushLog(`已删除 Model ${model.id}`);
 }
 
-// 子菜单通用入口：1=新增 2=修改 3=删除 0=返回
+// 子菜单通用入口：1=新增 2=修改 3=删除 0=返回。
+// 方向键高亮选择（inline 单行横排，左=上/右=下一维导航）+ 数字热键即时；Esc/q=返回；非 TTY 降级数字模式。
 async function manageResourceSubmenu(ask, pushLog, title, { add, update, remove }) {
+  const MENU = [
+    { label: "1=新增", value: "add" },
+    { label: "2=修改", value: "update" },
+    { label: "3=删除", value: "remove" },
+    { label: "0=返回", value: "back" },
+  ];
   while (true) {
-    console.log(`\n=== ${title} ===`);
-    console.log("1=新增  2=修改  3=删除  0=返回");
-    const action = (await ask("> ")).trim().toLowerCase();
-    if (action === "0" || action === "" || action === "q") return;
+    let action;
     try {
-      if (action === "1") await add(ask, pushLog);
-      else if (action === "2") await update(ask, pushLog);
-      else if (action === "3") await remove(ask, pushLog);
-      else pushLog(`未知命令: ${action}`);
+      action = await selectValue(globalRl, title, MENU, {
+        layout: "inline",
+        cancelOnEsc: true,
+        cancelOnQ: true,
+        hotkeys: {
+          "1": { value: "add" },
+          "2": { value: "update" },
+          "3": { value: "remove" },
+          "0": { value: "back" },
+        },
+        onFallback: async () => {
+          console.log(`\n=== ${title} ===`);
+          console.log("1=新增  2=修改  3=删除  0=返回");
+          const a = (await ask("> ")).trim().toLowerCase();
+          if (a === "1") return { value: "add", cancelled: false };
+          if (a === "2") return { value: "update", cancelled: false };
+          if (a === "3") return { value: "remove", cancelled: false };
+          if (a === "0" || a === "" || a === "q") return { value: null, cancelled: true };
+          pushLog(`未知命令: ${a}`);
+          return { value: "noop", cancelled: false };
+        },
+      });
     } catch (err) {
-      pushLog(`错误: ${err.message}`);
+      if (err instanceof CancelledError) pushLog("已取消");
+      else pushLog(`错误: ${err.message}`);
+      continue;
+    }
+    if (!action || action === "back") return;
+    if (action === "noop") continue;
+    try {
+      if (action === "add") await add(ask, pushLog);
+      else if (action === "update") await update(ask, pushLog);
+      else if (action === "remove") await remove(ask, pushLog);
+    } catch (err) {
+      if (err instanceof CancelledError) pushLog("已取消");
+      else pushLog(`错误: ${err.message}`);
     }
   }
 }
@@ -666,7 +710,7 @@ async function manageModelsFlow(ask, pushLog) {
 async function deleteProviderFlow(ask, pushLog) {
   const config = await refreshConfig();
   const provider = await pickProvider(ask, config, "选择要删除的 Provider：");
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
 
   const confirm = (await ask(`\n确认删除 ${provider.name}? (y/N): `)).trim().toLowerCase();
   if (confirm !== "y") {
@@ -685,10 +729,10 @@ async function switchFamilyFlow(ask, pushLog) {
     "选择要切换的 Claude 模型族：",
     FAMILY_ORDER.map((name) => ({ label: name, value: name })),
   );
-  if (!family) throw new Error("已取消");
+  if (!family) throw new CancelledError();
 
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new Error("已取消");
+  if (!provider) throw new CancelledError();
 
   if (!provider.baseUrls || provider.baseUrls.length === 0) {
     throw new Error(`Provider ${provider.id} 还没有 BaseUrl，请先 2 添加`);
@@ -701,7 +745,7 @@ async function switchFamilyFlow(ask, pushLog) {
       value: b,
     })),
   );
-  if (!baseUrl) throw new Error("已取消");
+  if (!baseUrl) throw new CancelledError();
 
   if (!provider.keys || provider.keys.length === 0) {
     throw new Error(`Provider ${provider.id} 还没有 Key，请先 3 添加`);
@@ -714,7 +758,7 @@ async function switchFamilyFlow(ask, pushLog) {
       value: k,
     })),
   );
-  if (!key) throw new Error("已取消");
+  if (!key) throw new CancelledError();
 
   if (!provider.models || provider.models.length === 0) {
     throw new Error(`Provider ${provider.id} 还没有 Model，请先 4 添加`);
@@ -730,7 +774,7 @@ async function switchFamilyFlow(ask, pushLog) {
       value: m,
     })),
   );
-  if (!model) throw new Error("已取消");
+  if (!model) throw new CancelledError();
 
   await api(`/families/${encodeURIComponent(family)}`, {
     method: "PUT",
@@ -845,14 +889,11 @@ async function exportConfigFlow(ask, pushLog) {
   const config = await refreshConfig();
   const defaultPath = path.join(EXPORT_DEFAULT_DIR, `gateway-${timestampForFile()}.json`);
   console.log(`\n默认导出路径: ${defaultPath}`);
-  const input = (await ask("导出路径（回车=默认，输入 q 取消）: ")).trim();
+  const input = await askCancelable(ask, "导出路径（回车=默认，q 取消）: ", { keepBlank: true });
 
   let targetPath;
   if (input === "" ) {
     targetPath = defaultPath;
-  } else if (input.toLowerCase() === "q" || input.toLowerCase() === "quit") {
-    pushLog("取消导出");
-    return;
   } else if (input.endsWith(path.sep) || input.endsWith("/") || input.endsWith("\\")) {
     targetPath = path.join(input, `gateway-${timestampForFile()}.json`);
   } else if (input.includes(path.sep) || input.includes("/") || input.includes("\\") || input.endsWith(".json")) {
@@ -881,8 +922,7 @@ async function exportConfigFlow(ask, pushLog) {
 }
 
 async function changePortFlow(ask, pushLog, runtime) {
-  const input = (await ask("\n新的监听端口（1-65535）: ")).trim();
-  if (!input) throw new Error("已取消");
+  const input = await askCancelable(ask, "\n新的监听端口（1-65535，q 取消）: ", { keepBlank: false });
   const port = Number.parseInt(input, 10);
   if (!Number.isFinite(port) || port <= 0 || port > 65535) {
     throw new Error("端口不合法（1-65535）");
@@ -899,9 +939,9 @@ async function changePortFlow(ask, pushLog, runtime) {
   });
   if (!probe.free) {
     const occ = probe.occupant || {};
-    console.warn(`端口 ${port} 已被占用`);
+    console.log(`端口 ${port} 已被占用`);
     if (occ.pid) {
-      console.warn(`占用进程: PID=${occ.pid} name=${occ.name || "?"}${occ.cmdline ? " cmd=" + occ.cmdline : ""}`);
+      console.log(`占用进程: PID=${occ.pid} name=${occ.name || "?"}${occ.cmdline ? " cmd=" + occ.cmdline : ""}`);
     }
     const answer = (await ask("是否杀掉占用进程并继续？(y/N): ")).trim().toLowerCase();
     if (answer !== "y") {
@@ -1010,6 +1050,7 @@ export async function startCli({ config, runtime }) {
     output: process.stdout,
     terminal: true,
   });
+  globalRl = rl;
   const ask = makeAsk(rl);
 
   pushLog("CLI 就绪，输入命令后回车");
@@ -1056,9 +1097,15 @@ export async function startCli({ config, runtime }) {
       lastOpResult = "ok";
       lastOpError = null;
     } catch (err) {
-      pushLog(`错误: ${err.message}`);
-      lastOpResult = "error";
-      lastOpError = err.message;
+      if (err instanceof CancelledError) {
+        pushLog("已取消");
+        lastOpResult = null;
+        lastOpError = null;
+      } else {
+        pushLog(`错误: ${err.message}`);
+        lastOpResult = "error";
+        lastOpError = err.message;
+      }
     }
   }
 
