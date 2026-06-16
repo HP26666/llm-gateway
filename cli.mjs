@@ -46,6 +46,27 @@ let gatewayUrl = "http://127.0.0.1:8000";
 // 由 startCli 创建 readline 后赋值，供 pickOption / 子菜单的 selectValue 复用方向键选择。
 let globalRl = null;
 
+// 命令面板选项：label 复用 renderCommandList 字符串，value 与 handleCommand case 对齐。
+// 数字/字母全作 hotkey 即时执行；方向键移动高亮，回车确认当前项。
+const COMMAND_OPTIONS = [
+  { label: "1=新建Provider", value: "1" },
+  { label: "2=BaseUrl",      value: "2" },
+  { label: "3=Key",          value: "3" },
+  { label: "4=Model",        value: "4" },
+  { label: "5=切换Family",  value: "5" },
+  { label: "6=修改端口",    value: "6" },
+  { label: "7=历史",         value: "7" },
+  { label: "8=日志",         value: "8" },
+  { label: "9=导出",         value: "9" },
+  { label: "0=删除Provider", value: "0" },
+  { label: "r=刷新",         value: "r" },
+  { label: "q=退出",         value: "q" },
+];
+const COMMAND_HOTKEYS = Object.fromEntries(
+  COMMAND_OPTIONS.map((o) => [o.value, { value: o.value }]),
+);
+let lastCommandIndex = 0;
+
 function setGatewayUrl(url) {
   gatewayUrl = String(url || gatewayUrl);
 }
@@ -280,10 +301,39 @@ function renderHome({ config, runtime, statusLine }) {
   const footer = statusLine || "状态: 就绪";
   const body = renderBox("LLM Gateway CLI", lines, { footer, width: totalWidth });
   console.log(body);
-  console.log("");
-  for (const line of renderCommandList(totalWidth)) {
-    console.log(line);
+}
+
+async function awaitCommandPanel(ask, totalWidth) {
+  if (process.env.LLM_CLI_NO_KEYSELECT === "1") {
+    return fallbackMainCommand(ask, totalWidth);
   }
+  const value = await selectValue(
+    globalRl,
+    "命令（数字/字母直接执行 · 方向键移动 · 回车确认高亮 · r 刷新 · q 退出 · Esc 回顶部）",
+    COMMAND_OPTIONS,
+    {
+      layout: "grid",
+      colWidth: 16,
+      hotkeys: COMMAND_HOTKEYS,
+      cancelOnEsc: true,
+      cancelOnQ: false,
+      startIndex: lastCommandIndex,
+      onFallback: async () => {
+        const cmd = await fallbackMainCommand(ask, totalWidth);
+        return { value: cmd, cancelled: false };
+      },
+    },
+  );
+  if (value !== null) {
+    const idx = COMMAND_OPTIONS.findIndex((o) => o.value === value);
+    if (idx >= 0) lastCommandIndex = idx;
+  }
+  return value;
+}
+
+async function fallbackMainCommand(ask, totalWidth) {
+  for (const line of renderCommandList(totalWidth)) console.log(line);
+  return await ask("> ");
 }
 
 function makeAsk(rl) {
@@ -821,17 +871,20 @@ async function viewLogsLiveFlow(rl, pushLog) {
 
     const render = () => {
       if (stopped) return;
-      fullClear();
-      const recent = getRecentLogs(50);
-      console.log("===== 实时网关日志（最近 50 条，每秒刷新）=====");
-      if (recent.length === 0) {
-        console.log("(暂无日志)");
-      } else {
-        for (const line of recent) console.log(line);
-      }
-      console.log("=".repeat(40));
-      console.log("[按 q / Ctrl-C / Esc 返回主界面]");
+      // renderedOnce 必须在 try 之前设，否则首次 render 抛错会永远不响应退出按键
       renderedOnce = true;
+      try {
+        fullClear();
+        const recent = getRecentLogs(50);
+        console.log("===== 实时网关日志（最近 50 条，每秒刷新）=====");
+        if (recent.length === 0) {
+          console.log("(暂无日志)");
+        } else {
+          for (const line of recent) console.log(line);
+        }
+        console.log("=".repeat(40));
+        console.log("[按 q / Ctrl-C / Esc 返回主界面]");
+      } catch {}
     };
 
     const cleanup = () => {
@@ -1088,14 +1141,20 @@ export async function startCli({ config, runtime }) {
       statusLine,
     });
 
-    const cmd = await ask("> ");
+    const cmd = await awaitCommandPanel(ask, terminalWidth());
     try {
-      const result = await handleCommand(cmd.trim(), { ask, pushLog, runtime, rl });
+      const result = await handleCommand(cmd == null ? "" : cmd.trim(), { ask, pushLog, runtime, rl });
       if (result === "exit") {
         running = false;
       }
-      lastOpResult = "ok";
-      lastOpError = null;
+      // cmd 为 null（Esc/Ctrl-C 取消）不记为"成功"，避免覆盖错误态
+      if (cmd == null) {
+        lastOpResult = null;
+        lastOpError = null;
+      } else {
+        lastOpResult = "ok";
+        lastOpError = null;
+      }
     } catch (err) {
       if (err instanceof CancelledError) {
         pushLog("已取消");
@@ -1106,6 +1165,13 @@ export async function startCli({ config, runtime }) {
         lastOpResult = "error";
         lastOpError = err.message;
       }
+      try {
+        if (process.stdin.isTTY
+            && typeof process.stdin.setRawMode === "function"
+            && process.stdin.isRaw) {
+          process.stdin.setRawMode(false);
+        }
+      } catch {}
     }
   }
 
