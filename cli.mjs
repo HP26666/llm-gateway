@@ -561,7 +561,10 @@ async function updateModelFlow(ask, pushLog) {
     ask,
     "选择要修改的 Model：",
     provider.models.map((m) => ({
-      label: `${m.name} (型号: ${m.model})`,
+      // 演示模式：隐藏括号里的真实上游型号，只显示显示名。
+      // 需要恢复时——取消注释下面那行、并删掉紧随其后的 label 行即可。
+      // label: `${m.name} (型号: ${m.model})`,
+      label: `${m.name}`,
       value: m,
     })),
   );
@@ -597,7 +600,10 @@ async function deleteModelFlow(ask, pushLog) {
     ask,
     "选择要删除的 Model：",
     provider.models.map((m) => ({
-      label: `${m.name} (型号: ${m.model})`,
+      // 演示模式：隐藏括号里的真实上游型号，只显示显示名。
+      // 需要恢复时——取消注释下面那行、并删掉紧随其后的 label 行即可。
+      // label: `${m.name} (型号: ${m.model})`,
+      label: `${m.name}`,
       value: m,
     })),
   );
@@ -717,7 +723,10 @@ async function switchFamilyFlow(ask, pushLog) {
     ask,
     "选择 Model：",
     provider.models.map((m) => ({
-      label: `${m.name} (型号: ${m.model})`,
+      // 演示模式：隐藏括号里的真实上游型号，只显示显示名。
+      // 需要恢复时——取消注释下面那行、并删掉紧随其后的 label 行即可。
+      // label: `${m.name} (型号: ${m.model})`,
+      label: `${m.name}`,
       value: m,
     })),
   );
