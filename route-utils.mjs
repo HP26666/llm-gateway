@@ -105,20 +105,17 @@ function maskUrl(url) {
 }
 
 export function describeBinding(config, binding) {
-  if (
-    !binding
-    || !binding.providerId
-    || !binding.baseUrlId
-    || !binding.modelId
-    || !binding.keyId
-  ) {
+  const isList = Array.isArray(binding?.candidates);
+  const quad = isList ? getPrimaryQuad(binding) : binding;
+
+  if (!quad || !quad.providerId || !quad.baseUrlId || !quad.modelId || !quad.keyId) {
     return "未配置";
   }
 
-  const provider = config.providers[binding.providerId];
-  const baseUrl = findProviderBaseUrl(provider, binding.baseUrlId);
-  const model = findProviderModel(provider, binding.modelId);
-  const key = findProviderKey(provider, binding.keyId);
+  const provider = config.providers?.[quad.providerId];
+  const baseUrl = findProviderBaseUrl(provider, quad.baseUrlId);
+  const model = findProviderModel(provider, quad.modelId);
+  const key = findProviderKey(provider, quad.keyId);
 
   if (!provider || !baseUrl || !model || !key) {
     return "配置已失效";
@@ -130,54 +127,103 @@ export function describeBinding(config, binding) {
     baseUrl.note || maskUrl(baseUrl.url),
     key.note || key.id,
   ];
-  return segments.join(" · ");
+  const label = segments.join(" · ");
+  if (isList) {
+    const extra = binding.candidates.filter(isMeaningfulQuad).length - 1;
+    return extra > 0 ? `${label} (+${extra}备)` : label;
+  }
+  return label;
 }
 
-export function resolveBoundRoute(config, family) {
-  const binding = config.modelFamilies[family];
-  if (!binding) {
-    return { kind: "unknown_family", modelFamily: family };
+// 统一读取 family 绑定：兼容旧单四元组形态 → 规范成 { candidates, strategy, circuitBreaker }。
+export function getFamilyBinding(config, family) {
+  const raw = config?.modelFamilies?.[family];
+  if (!raw || typeof raw !== "object") {
+    return { candidates: [], strategy: "failover", circuitBreaker: null };
   }
-
-  if (
-    !binding.providerId
-    || !binding.baseUrlId
-    || !binding.modelId
-    || !binding.keyId
-  ) {
-    return { kind: "unconfigured", modelFamily: family, binding };
+  if (Array.isArray(raw.candidates)) {
+    const strategy = raw.strategy === "round_robin" || raw.strategy === "weighted" ? raw.strategy : "failover";
+    return { candidates: raw.candidates.slice(), strategy, circuitBreaker: raw.circuitBreaker ?? null };
   }
+  return { candidates: [raw], strategy: "failover", circuitBreaker: null };
+}
 
-  const providerConfig = config.providers[binding.providerId];
-  const baseUrl = findProviderBaseUrl(providerConfig, binding.baseUrlId);
-  const model = findProviderModel(providerConfig, binding.modelId);
-  const key = findProviderKey(providerConfig, binding.keyId);
+function isMeaningfulQuad(quad) {
+  return Boolean(quad && (quad.providerId || quad.baseUrlId || quad.keyId || quad.modelId));
+}
 
-  if (!providerConfig || !baseUrl || !model || !key || !key.token) {
-    return {
-      kind: "invalid_binding",
-      modelFamily: family,
-      binding,
-      providerConfig,
-      baseUrl,
-      model,
-      key,
-    };
+// 主候选四元组（兼容旧形态：旧 binding 本身即四元组）。
+export function getPrimaryQuad(binding) {
+  if (!binding || typeof binding !== "object") return null;
+  if (Array.isArray(binding.candidates)) {
+    return binding.candidates.find(isMeaningfulQuad) ?? null;
   }
+  return isMeaningfulQuad(binding) ? binding : null;
+}
 
+// 某 family 全部有效候选四元组（供 admin 引用检查使用）。
+export function getAllQuads(config, family) {
+  return getFamilyBinding(config, family).candidates.filter(isMeaningfulQuad);
+}
+
+// 单个四元组 → 完整 route。解析失败（provider/key/baseUrl/model 缺失）返回 null。
+function resolveQuad(config, quad, family) {
+  const providerConfig = config.providers?.[quad.providerId];
+  const baseUrl = findProviderBaseUrl(providerConfig, quad.baseUrlId);
+  const model = findProviderModel(providerConfig, quad.modelId);
+  const key = findProviderKey(providerConfig, quad.keyId);
+  if (!providerConfig || !baseUrl || !model || !key || !key.token) return null;
   return {
     kind: "ok",
     modelFamily: family,
-    binding,
+    binding: quad,
     providerConfig,
     providerId: providerConfig.id,
     baseUrl,
     baseUrlId: baseUrl.id,
     model,
+    modelId: model.id,
     key,
+    keyId: key.id,
     upstreamModel: model.model,
     upstreamUrl: baseUrl.url,
   };
+}
+
+// 解析某 family 全部候选 route + 策略 + 熔断参数（failover 调度用）。
+export function resolveCandidates(config, family) {
+  if (!config.modelFamilies || !(family in config.modelFamilies)) {
+    return { kind: "unknown_family", modelFamily: family, candidates: [], strategy: "failover", circuitBreaker: null };
+  }
+  const binding = getFamilyBinding(config, family);
+  const candidates = binding.candidates
+    .filter(isMeaningfulQuad)
+    .map((quad) => resolveQuad(config, quad, family))
+    .filter(Boolean);
+  if (candidates.length === 0) {
+    return { kind: "unconfigured", modelFamily: family, candidates: [], strategy: binding.strategy, circuitBreaker: binding.circuitBreaker };
+  }
+  return { kind: "ok", modelFamily: family, candidates, strategy: binding.strategy, circuitBreaker: binding.circuitBreaker };
+}
+
+// 主候选 route（/health、显示、单候选回退场景）。保持原返回结构，下游无感知。
+export function resolveBoundRoute(config, family) {
+  if (!config.modelFamilies || !(family in config.modelFamilies)) {
+    return { kind: "unknown_family", modelFamily: family };
+  }
+  const binding = getFamilyBinding(config, family);
+  for (const quad of binding.candidates) {
+    if (!isMeaningfulQuad(quad)) continue;
+    const route = resolveQuad(config, quad, family);
+    if (route) return route;
+  }
+  return { kind: "unconfigured", modelFamily: family, binding };
+}
+
+export function logFailoverSwitch({ family, fromProvider, toProvider, status, reason }) {
+  const now = new Date().toISOString();
+  const line = `[failover] ${now} family=${family ?? "?"} ${fromProvider ?? "?"} -> ${toProvider ?? "?"} status=${status ?? "?"}${reason ? ` (${reason})` : ""}`;
+  emitLog(line);
 }
 
 export function summarizeFamilyRoute(config, family) {
