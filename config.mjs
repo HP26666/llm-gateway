@@ -17,7 +17,7 @@ const MAX_HISTORY_ITEMS = 200;
 export const CURRENT_CONFIG_VERSION = 3;
 
 function emptyBinding() {
-  return { providerId: null, baseUrlId: null, keyId: null, modelId: null };
+  return { candidates: [], strategy: "failover", circuitBreaker: null };
 }
 
 const DEFAULT_MODEL_FAMILIES = {
@@ -39,8 +39,10 @@ export function createEmptyConfig() {
       host: DEFAULT_HOST,
       port: DEFAULT_PORT,
       sharedToken: null,
+      adminToken: null,
     },
     providers: {},
+    circuitBreaker: null,
     modelFamilies: structuredClone(DEFAULT_MODEL_FAMILIES),
     history: [],
   };
@@ -184,16 +186,17 @@ function normalizeProviders(providers) {
   );
 }
 
-function normalizeFamilyRoute(route, providerMap) {
-  if (!route || typeof route !== "object") {
-    return emptyBinding();
-  }
+const FAMILY_STRATEGIES = new Set(["failover", "round_robin", "weighted"]);
 
-  const providerId = normalizeNullableString(route.providerId);
-  const keyId = normalizeNullableString(route.keyId);
-  const modelId = normalizeNullableString(route.modelId);
+// 规范化单个候选四元组。保留 baseUrlId 回退（provider 首个 baseUrl）。
+function normalizeQuad(quad, providerMap) {
+  if (!quad || typeof quad !== "object") return null;
 
-  let baseUrlId = normalizeNullableString(route.baseUrlId);
+  const providerId = normalizeNullableString(quad.providerId);
+  const keyId = normalizeNullableString(quad.keyId);
+  const modelId = normalizeNullableString(quad.modelId);
+  let baseUrlId = normalizeNullableString(quad.baseUrlId);
+
   if (!baseUrlId && providerId && providerMap[providerId]) {
     const provider = providerMap[providerId];
     if (provider.baseUrls && provider.baseUrls.length > 0) {
@@ -202,6 +205,53 @@ function normalizeFamilyRoute(route, providerMap) {
   }
 
   return { providerId, baseUrlId, keyId, modelId };
+}
+
+// 至少有一个非空字段才算有效候选；全 null 的丢弃（CLI 半成品清理）。
+function isMeaningfulQuad(quad) {
+  if (!quad) return false;
+  return Boolean(quad.providerId || quad.baseUrlId || quad.keyId || quad.modelId);
+}
+
+// 规范化 per-family 或全局熔断参数覆盖。空对象/无效返回 null（用全局默认）。
+function normalizeCircuitBreaker(cb) {
+  if (!cb || typeof cb !== "object") return null;
+
+  const out = {};
+  if (Number.isFinite(Number(cb.failureThreshold))) {
+    out.failureThreshold = Math.max(1, Number(cb.failureThreshold));
+  }
+  if (Number.isFinite(Number(cb.coolDownMs))) {
+    out.coolDownMs = Math.max(0, Number(cb.coolDownMs));
+  }
+  if (Number.isFinite(Number(cb.successThreshold))) {
+    out.successThreshold = Math.max(1, Number(cb.successThreshold));
+  }
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+// family 绑定：{ candidates:[...四元组], strategy, circuitBreaker }。
+// 向后兼容：旧顶层单四元组（无 candidates 数组）自动包成 1 元素列表。
+function normalizeFamilyRoute(route, providerMap) {
+  if (!route || typeof route !== "object") {
+    return emptyBinding();
+  }
+
+  if (Array.isArray(route.candidates)) {
+    const candidates = route.candidates
+      .map((c) => normalizeQuad(c, providerMap))
+      .filter(isMeaningfulQuad);
+    const strategy = FAMILY_STRATEGIES.has(route.strategy) ? route.strategy : "failover";
+    return { candidates, strategy, circuitBreaker: normalizeCircuitBreaker(route.circuitBreaker) };
+  }
+
+  // 旧形态：顶层单四元组 → 1 元素 candidates
+  const legacyQuad = normalizeQuad(route, providerMap);
+  if (isMeaningfulQuad(legacyQuad)) {
+    return { candidates: [legacyQuad], strategy: "failover", circuitBreaker: null };
+  }
+  return emptyBinding();
 }
 
 function normalizeHistoryRoute(route) {
@@ -248,8 +298,10 @@ export function normalizeConfig(rawConfig) {
       host: normalizeString(config.gateway?.host, DEFAULT_HOST),
       port: normalizePort(config.gateway?.port),
       sharedToken: normalizeNullableString(config.gateway?.sharedToken),
+      adminToken: normalizeNullableString(config.gateway?.adminToken),
     },
     providers,
+    circuitBreaker: normalizeCircuitBreaker(config.circuitBreaker),
     modelFamilies: {
       opus: normalizeFamilyRoute(config.modelFamilies?.opus, providers),
       sonnet: normalizeFamilyRoute(config.modelFamilies?.sonnet, providers),

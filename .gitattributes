@@ -1,0 +1,7 @@
+# 统一文本文件为 LF 换行符，避免跨平台 CRLF 导致的假 diff。
+# 远端仓库（HP26666/llm-gateway）现有文件均为 LF，保持一致。
+* text=auto eol=lf
+
+# Windows 批处理脚本必须用 CRLF，否则老版本 cmd 解析异常
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,9 +1,9 @@
 {
   "name": "llm-gateway",
-  "version": "3.1.0",
+  "version": "3.3.0",
   "private": true,
   "type": "module",
-  "description": "Local Anthropic-compatible LLM gateway with single-entry CLI + gateway runtime.",
+  "description": "Local LLM gateway (Anthropic Messages + OpenAI Responses APIs) with single-entry CLI + gateway runtime.",
   "scripts": {
     "start": "node main.mjs",
     "test": "node --test"

@@ -3,7 +3,7 @@ import { writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { FAMILY_ORDER, getLastUpstreamError, getRecentLogs, setSuppressConsole } from "./route-utils.mjs";
+import { FAMILY_ORDER, getLastUpstreamError, getRecentLogs, setSuppressConsole, getPrimaryQuad } from "./route-utils.mjs";
 import { selectValue, fallbackPickOptionByNumber, CancelledError } from "./cli-select.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -59,6 +59,7 @@ const COMMAND_OPTIONS = [
   { label: "8=日志",         value: "8" },
   { label: "9=导出",         value: "9" },
   { label: "0=删除Provider", value: "0" },
+  { label: "u=用量",         value: "u" },
   { label: "r=刷新",         value: "r" },
   { label: "q=退出",         value: "q" },
 ];
@@ -75,14 +76,28 @@ function getGatewayUrl() {
   return gatewayUrl;
 }
 
+// admin 鉴权 token(由 startCli 从 config.gateway.adminToken 注入)。
+// 默认 null = 不带 X-Admin-Token 头,与 ensureAdminAuth 的 null 放行一致(向后兼容)。
+let adminToken = null;
+
+function setAdminToken(token) {
+  adminToken = token ? String(token) : null;
+}
+
+// 构造 admin 请求头。token 非空时带 X-Admin-Token;extra 允许调用方覆盖(含 token 本身)。
+export function buildAdminHeaders(extra, token) {
+  return {
+    "Content-Type": "application/json",
+    "X-Admin-Source": "cli",
+    ...(token ? { "X-Admin-Token": token } : {}),
+    ...(extra || {}),
+  };
+}
+
 async function api(path, options = {}) {
   const init = {
     method: options.method || "GET",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Admin-Source": "cli",
-      ...(options.headers || {}),
-    },
+    headers: buildAdminHeaders(options.headers, adminToken),
   };
   if (options.body !== undefined) {
     init.body = typeof options.body === "string" ? options.body : JSON.stringify(options.body);
@@ -203,17 +218,19 @@ function fullClear() {
   process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 }
 
-function describeRouteLabel(config, binding) {
-  if (!binding || !binding.providerId || !binding.baseUrlId || !binding.modelId || !binding.keyId) {
+export function describeRouteLabel(config, binding) {
+  // 兼容新形态（{candidates,strategy,circuitBreaker}）与旧四元组：统一取主候选。
+  const quad = getPrimaryQuad(binding) ?? binding;
+  if (!quad || !quad.providerId || !quad.baseUrlId || !quad.modelId || !quad.keyId) {
     return "(未配置)";
   }
-  const provider = config.providers?.[binding.providerId];
+  const provider = config.providers?.[quad.providerId];
   if (!provider) {
     return "(配置已失效)";
   }
-  const baseUrl = provider.baseUrls?.find((b) => b.id === binding.baseUrlId);
-  const model = provider.models?.find((m) => m.id === binding.modelId);
-  const key = provider.keys?.find((k) => k.id === binding.keyId);
+  const baseUrl = provider.baseUrls?.find((b) => b.id === quad.baseUrlId);
+  const model = provider.models?.find((m) => m.id === quad.modelId);
+  const key = provider.keys?.find((k) => k.id === quad.keyId);
   if (!baseUrl || !model || !key) {
     return "(配置已失效)";
   }
@@ -251,12 +268,49 @@ function renderBox(title, lines, opts = {}) {
   return out.join("\n");
 }
 
+// ===== 用量图表渲染（纯 Unicode，零依赖）=====
+
+const SPARK_BLOCKS = " ▁▂▃▄▅▆▇█";
+
+// 微型折线图：8 级高度。空数据返回空串。所有值相同时显示中间高度，避免全空。
+function sparkline(values) {
+  if (!Array.isArray(values) || values.length === 0) return "";
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = max - min;
+  return values
+    .map((v) => {
+      const norm = range === 0 ? 4 : Math.round(((v - min) / range) * 8);
+      return SPARK_BLOCKS[Math.max(0, Math.min(8, norm))];
+    })
+    .join("");
+}
+
+// 把 token 数格式化成人类可读：1.2K / 3.4M / 5.6B
+function formatTokens(n) {
+  const v = Number(n) || 0;
+  if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(2)}B`;
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+  return String(v);
+}
+
+// 横向柱状图一行：label + 按比例填充的 █ 条 + 数值。
+// maxVal 是所有项中的最大值，用于计算填充比例；barWidth 是 █ 条的最大宽度。
+function barLine(label, value, maxVal, barWidth) {
+  const safeMax = maxVal > 0 ? maxVal : 1;
+  const ratio = Math.min(1, (Number(value) || 0) / safeMax);
+  const filled = Math.max(ratio > 0 ? 1 : 0, Math.round(ratio * barWidth));
+  const bar = "█".repeat(filled) + "░".repeat(Math.max(0, barWidth - filled));
+  return { label, bar, value };
+}
+
 // 命令面板：所有命令按视觉宽度对齐成多列；列数随终端宽度自适应。
 function renderCommandList(totalWidth) {
   const commands = [
     "1=新建Provider", "2=BaseUrl", "3=Key", "4=Model",
     "5=切换Family", "6=修改端口", "7=历史", "8=日志",
-    "9=导出", "0=删除Provider", "r=刷新", "q=退出",
+    "9=导出", "0=删除Provider", "u=用量", "r=刷新", "q=退出",
   ];
   const colWidth = 16;
   const prefix = "  ";
@@ -772,17 +826,20 @@ async function deleteProviderFlow(ask, pushLog) {
   pushLog(`已删除 Provider ${provider.id}`);
 }
 
-async function switchFamilyFlow(ask, pushLog) {
-  const config = await refreshConfig();
-  const family = await pickOption(
-    ask,
-    "选择要切换的 Claude 模型族：",
-    FAMILY_ORDER.map((name) => ({ label: name, value: name })),
-  );
-  if (!family) throw new CancelledError();
+// 把单个候选四元组显示成可读标签（provider · model · baseUrl · key）
+function describeCandidate(config, quad) {
+  const p = config.providers?.[quad?.providerId];
+  if (!p) return `(失效 ${quad?.providerId || "?"})`;
+  const b = p.baseUrls?.find((x) => x.id === quad.baseUrlId);
+  const m = p.models?.find((x) => x.id === quad.modelId);
+  const k = p.keys?.find((x) => x.id === quad.keyId);
+  return [p.name, m?.name || m?.model || "?", b?.note || b?.url || "?", k?.note || k?.id || "?"].join(" · ");
+}
 
+// 选 provider -> baseUrl -> key -> model，返回四元组或 null（取消）。
+async function pickCandidateQuad(ask, config) {
   const provider = await pickProvider(ask, config);
-  if (!provider) throw new CancelledError();
+  if (!provider) return null;
 
   if (!provider.baseUrls || provider.baseUrls.length === 0) {
     throw new Error(`Provider ${provider.id} 还没有 BaseUrl，请先 2 添加`);
@@ -790,12 +847,9 @@ async function switchFamilyFlow(ask, pushLog) {
   const baseUrl = await pickOption(
     ask,
     "选择 BaseUrl：",
-    provider.baseUrls.map((b) => ({
-      label: `${b.note || "(无备注)"} -> ${b.url}`,
-      value: b,
-    })),
+    provider.baseUrls.map((b) => ({ label: `${b.note || "(无备注)"} -> ${b.url}`, value: b })),
   );
-  if (!baseUrl) throw new CancelledError();
+  if (!baseUrl) return null;
 
   if (!provider.keys || provider.keys.length === 0) {
     throw new Error(`Provider ${provider.id} 还没有 Key，请先 3 添加`);
@@ -803,12 +857,9 @@ async function switchFamilyFlow(ask, pushLog) {
   const key = await pickOption(
     ask,
     "选择 Key：",
-    provider.keys.map((k) => ({
-      label: `${k.note || k.id} (token: ${k.token || "***"})`,
-      value: k,
-    })),
+    provider.keys.map((k) => ({ label: `${k.note || k.id} (token: ${k.token || "***"})`, value: k })),
   );
-  if (!key) throw new CancelledError();
+  if (!key) return null;
 
   if (!provider.models || provider.models.length === 0) {
     throw new Error(`Provider ${provider.id} 还没有 Model，请先 4 添加`);
@@ -816,26 +867,101 @@ async function switchFamilyFlow(ask, pushLog) {
   const model = await pickOption(
     ask,
     "选择 Model：",
-    provider.models.map((m) => ({
-      // 演示模式：隐藏括号里的真实上游型号，只显示显示名。
-      // 需要恢复时——取消注释下面那行、并删掉紧随其后的 label 行即可。
-      // label: `${m.name} (型号: ${m.model})`,
-      label: `${m.name}`,
-      value: m,
-    })),
+    provider.models.map((m) => ({ label: `${m.name}`, value: m })),
   );
-  if (!model) throw new CancelledError();
+  if (!model) return null;
 
-  await api(`/families/${encodeURIComponent(family)}`, {
+  return { providerId: provider.id, baseUrlId: baseUrl.id, keyId: key.id, modelId: model.id };
+}
+
+async function switchFamilyFlow(ask, pushLog) {
+  const config = await refreshConfig();
+  const family = await pickOption(
+    ask,
+    "选择要配置的 Claude 模型族：",
+    FAMILY_ORDER.map((name) => ({ label: name, value: name })),
+  );
+  if (!family) throw new CancelledError();
+
+  const rawBinding = config.modelFamilies?.[family] || {};
+  // 兼容新旧形态：新 {candidates,strategy} 与旧单四元组
+  let candidates;
+  if (Array.isArray(rawBinding.candidates)) {
+    candidates = rawBinding.candidates.filter(
+      (c) => c && (c.providerId || c.baseUrlId || c.keyId || c.modelId),
+    );
+  } else if (rawBinding.providerId || rawBinding.modelId) {
+    candidates = [rawBinding];
+  } else {
+    candidates = [];
+  }
+  let strategy = ["failover", "round_robin", "weighted"].includes(rawBinding.strategy)
+    ? rawBinding.strategy
+    : "failover";
+
+  const STRATEGY_OPTIONS = ["failover", "round_robin", "weighted"].map((s) => ({ label: s, value: s }));
+
+  // 候选列表编辑子菜单
+  while (true) {
+    console.log(`\n===== ${family} 候选列表（策略: ${strategy}）=====`);
+    if (candidates.length === 0) {
+      console.log("(空 —— 需追加候选)");
+    }
+    candidates.forEach((c, i) => {
+      console.log(`  ${i === 0 ? "[主]" : ` ${i}.`}  ${describeCandidate(config, c)}`);
+    });
+
+    const action = await pickOption(ask, "\n操作：", [
+      { label: "追加候选", value: "add" },
+      { label: "删除候选", value: "del" },
+      { label: "设为主候选（置顶）", value: "promote" },
+      { label: `切换策略（当前 ${strategy}）`, value: "strategy" },
+      { label: "保存并返回", value: "save" },
+      { label: "放弃返回", value: "cancel" },
+    ]);
+
+    if (!action || action === "cancel") {
+      pushLog(`取消编辑 ${family}`);
+      return;
+    }
+    if (action === "save") break;
+    if (action === "add") {
+      const quad = await pickCandidateQuad(ask, config);
+      if (quad) candidates.push(quad);
+      continue;
+    }
+    if (action === "strategy") {
+      const next = await pickOption(ask, "选择策略：", STRATEGY_OPTIONS);
+      if (next) strategy = next;
+      continue;
+    }
+    if (candidates.length === 0) {
+      console.log("(列表为空，无可操作候选)");
+      continue;
+    }
+    // del / promote 需先选一个候选
+    const idx = await pickOption(
+      ask,
+      "选择候选：",
+      candidates.map((c, i) => ({
+        label: `${i}${i === 0 ? " (主)" : ""}  ${describeCandidate(config, c)}`,
+        value: i,
+      })),
+    );
+    if (idx === null || idx === undefined) continue;
+    if (action === "del") {
+      candidates.splice(idx, 1);
+    } else if (action === "promote" && idx > 0) {
+      const [moved] = candidates.splice(idx, 1);
+      candidates.unshift(moved);
+    }
+  }
+
+  await api(`/families/${encodeURIComponent(family)}/candidates`, {
     method: "PUT",
-    body: {
-      providerId: provider.id,
-      baseUrlId: baseUrl.id,
-      keyId: key.id,
-      modelId: model.id,
-    },
+    body: { candidates, strategy },
   });
-  pushLog(`已切换 ${family} -> ${provider.name} · ${model.name}`);
+  pushLog(`已保存 ${family}：${candidates.length} 个候选，策略 ${strategy}`);
 }
 
 async function viewHistoryFlow(ask, pushLog) {
@@ -852,6 +978,113 @@ async function viewHistoryFlow(ask, pushLog) {
   console.log("===================");
   await ask("\n按回车返回... ");
   pushLog(`查看历史（${history.length} 条）`);
+}
+
+// 用量统计视图：支持切换时间范围（今日/7天/30天），展示 token 趋势 sparkline、
+// 按 family / provider 分布柱状图、输入/输出/缓存构成。参考 viewLogsLiveFlow 的按键退出模式。
+async function viewUsageFlow(ask, pushLog) {
+  const RANGE_OPTIONS = [
+    { label: "今日", value: "today" },
+    { label: "7天", value: "7d" },
+    { label: "30天", value: "30d" },
+  ];
+
+  let currentRange = "today";
+
+  while (true) {
+    let data;
+    try {
+      data = await api(`/usage/${currentRange}`);
+    } catch (err) {
+      console.log(`\n获取用量失败: ${err.message}`);
+      await ask("按回车返回... ");
+      pushLog(`查看用量失败: ${err.message}`);
+      return;
+    }
+
+    fullClear();
+    const totalWidth = terminalWidth();
+    const rangeLabel = RANGE_OPTIONS.find((r) => r.value === currentRange)?.label || currentRange;
+    const lines = [];
+
+    lines.push(`范围: ${rangeLabel}    总计 ${formatTokens(data.totals.total)} · 请求 ${data.totals.reqs} 次 · 错误 ${data.totals.errors}`);
+    lines.push("");
+
+    // —— 时间趋势 sparkline ——
+    const spark = sparkline(data.timeBuckets);
+    if (spark) {
+      lines.push(`Token 趋势（${currentRange === "today" ? "每小时" : "每天"}）`);
+      lines.push(`  ${spark}`);
+      if (data.peak > 0) {
+        lines.push(`  峰值 ${formatTokens(data.peak)} @ ${data.peakLabel}`);
+      }
+    } else {
+      lines.push("Token 趋势: (暂无数据)");
+    }
+    lines.push("");
+
+    // —— 按 Family 分布 ——
+    const familyEntries = Object.entries(data.byFamily).sort((a, b) => b[1].tokens - a[1].tokens);
+    if (familyEntries.length > 0) {
+      const maxFamTokens = familyEntries[0][1].tokens;
+      const famBarWidth = 20;
+      lines.push("按 Family 分布");
+      for (const [fam, info] of familyEntries) {
+        const { bar } = barLine(fam, info.tokens, maxFamTokens, famBarWidth);
+        const pct = data.totals.total > 0 ? ((info.tokens / data.totals.total) * 100).toFixed(0) : 0;
+        lines.push(`  ${padEnd(fam, 12)} ${bar} ${formatTokens(info.tokens)} (${pct}%, ${info.reqs}次)`);
+      }
+    } else {
+      lines.push("按 Family 分布: (暂无数据)");
+    }
+    lines.push("");
+
+    // —— 按 Provider 分布 ——
+    const providerEntries = Object.entries(data.byProvider).sort((a, b) => b[1].tokens - a[1].tokens);
+    if (providerEntries.length > 0) {
+      const maxProvTokens = providerEntries[0][1].tokens;
+      const provBarWidth = 20;
+      lines.push("按 Provider 分布");
+      for (const [prov, info] of providerEntries) {
+        const { bar } = barLine(prov, info.tokens, maxProvTokens, provBarWidth);
+        lines.push(`  ${padEnd(prov, 14)} ${bar} ${formatTokens(info.tokens)} (${info.reqs}次)`);
+      }
+    }
+    lines.push("");
+
+    // —— 输入/输出/缓存构成 ——
+    const compItems = [
+      { label: "输入", value: data.totals.in },
+      { label: "输出", value: data.totals.out },
+      { label: "缓存读", value: data.totals.cacheR },
+      { label: "缓存写", value: data.totals.cacheW },
+    ];
+    const maxComp = Math.max(1, ...compItems.map((c) => c.value));
+    const compBarWidth = 24;
+    lines.push("输入/输出/缓存 构成");
+    for (const { label, value } of compItems) {
+      const { bar } = barLine(label, value, maxComp, compBarWidth);
+      lines.push(`  ${padEnd(label, 6)} ${bar} ${formatTokens(value)}`);
+    }
+
+    const footer = `[1]今日 [2]7天 [3]30天 切换范围 · q/Esc/回车 返回`;
+    const body = renderBox("用量统计", lines, { footer, width: totalWidth });
+    console.log(body);
+
+    // 等待按键选择下一个操作
+    const action = await pickOption(ask, "\n操作：", [
+      { label: "切换到 今日", value: "today" },
+      { label: "切换到 7天", value: "7d" },
+      { label: "切换到 30天", value: "30d" },
+      { label: "返回主界面", value: "back" },
+    ]);
+
+    if (!action || action === "back") {
+      pushLog(`查看用量（${rangeLabel}）`);
+      return;
+    }
+    currentRange = action;
+  }
 }
 
 // 实时日志视图：清屏后只显示日志，每秒重新拉取最近 50 条；按 q/Ctrl-C/Esc 返回。
@@ -1057,6 +1290,9 @@ async function handleCommand(cmd, ctx) {
     case "8":
       await viewLogsLiveFlow(rl, pushLog);
       return null;
+    case "u":
+      await viewUsageFlow(ask, pushLog);
+      return null;
     case "9":
       await exportConfigFlow(ask, pushLog);
       return null;
@@ -1083,6 +1319,7 @@ export async function startCli({ config, runtime }) {
   if (runtime) {
     setGatewayUrl(runtime.getBaseUrl());
   }
+  setAdminToken(config?.gateway?.adminToken);
 
   // 关闭 gateway 日志的 stdout 打印：CLI 主循环 await ask() 期间，gateway 仍会
   // 并发处理请求并调用 logRequest 等。打开 suppress 后这些日志只进 buffer，

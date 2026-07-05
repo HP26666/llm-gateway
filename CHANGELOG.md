@@ -8,7 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- （暂无）
+
+## [3.3.0] - 2026-07-04
+
+### Added
+- **OpenAI Codex 接入：Responses API ↔ Anthropic Messages 双向转换**
+  - 新增端点 `POST /v1/responses`，供 Codex 桌面端/CLI（`wire_api="responses"`，2026 年唯一支持的协议）接入；现有 `/v1/messages`（Claude Code）链路零改动、零回归
+  - 新增三个零依赖 adapter：
+    - `responses-protocol.mjs`：SSE 解析/序列化、envelope、sequence 计数
+    - `responses-request-adapter.mjs`：Responses→Anthropic 请求转换（input/tools/tool_choice/system）
+    - `responses-response-adapter.mjs`：Anthropic→Responses 响应转换，含流式 SSE 状态机（text/tool_use/thinking）
+  - `tryWithFailover` 加可选 `upstreamPath` 参数：Responses 入口把客户端 `/v1/responses` 与上游 `/v1/messages` 解耦；`/v1/messages` 调用方不传该参数，行为完全不变
+  - 转换覆盖：`input`(message/function_call/function_call_output)↔messages、`tools`↔`input_schema`、`tool_choice` 三态、流式 SSE 事件状态机、`usage` 提取(含 cache_*)；连续同 role 内容自动合并（满足 Anthropic 交替约束 + 并行 tool_use 语义）
+  - 复用全部核心机制：Family 路由 / failover / 熔断 / 用量统计 / Provider 配置零改动；Codex 的 `model` 直接配 family 名（opus/sonnet/haiku）
+  - 流式用 `StringDecoder` 处理跨 TCP chunk 的多字节边界，避免中文 UTF-8 被拆成替换符
+  - 阶段性丢弃：`reasoning`/`previous_response_id`/`text.format`/`parallel_tool_calls`（reasoning↔thinking 映射留待后续按 per-family capabilities 开关）
+  - 配套测试 23 个（request/response adapter 单元 + failover/流式/工具调用集成），总测试 88→111 全绿
+  - 真机验证：`/v1/responses` 走 DeepSeek Flash，非流式 + 流式 + reasoning + 中文全链路正常
+- **Codex 侧配置**：`~/.codex/config.toml` 加 `[model_providers.<id>]`，`base_url=http://127.0.0.1:4000/v1`、`wire_api="responses"`、`env_key` 指向网关 sharedToken
+
+## [3.2.0] - 2026-06-27
+
+### Added
 - 版本管理规范和 CHANGELOG 文档
+- **多候选 failover + 熔断器**（commit `1991bec`）
+  - 每个 family 可绑定多个候选四元组（provider+baseUrl+key+model），按 `strategy` 调度：`failover`（主备）/ `round_robin`（轮转）
+  - 新增 `circuit-breaker.mjs`：标准三态机（CLOSED→OPEN→HALF_OPEN→CLOSED），模块级单例、被动统计（无主动探测/定时器，不耗额度）；全局默认 `failureThreshold=5` / `coolDownMs=60s` / `successThreshold=1`，per-family 可覆盖
+  - failover 触发集：fetch throw / ≥500 / 429 / 401·402·403（400/404 等请求格式类不切）；全部候选失败时透传最后候选的真实状态码（非伪造 502）
+  - `config.mjs` schema：`modelFamilies[family]` 升级为 `{ candidates, strategy, circuitBreaker }`，旧单四元组形态自动兼容（零迁移）
+  - admin 新端点 `PUT /admin/families/:family/candidates`；CLI 按键 5 改为候选列表编辑器（追加/删除/置顶/切策略）
+  - 配套测试：circuit-breaker / failover / compat（向后兼容）/ cli-display
+- **用量统计**（commit `8fee3bf`）
+  - 新增 `usage-store.mjs`：按天追加写 `data/usage-YYYYMMDD.jsonl`（天然原子、保留 30 天、每 6h 惰性清理）
+  - 每个请求完成时 `recordUsage`（in/out/cacheR/cacheW/status/ms 等），失败只告警、不影响主请求
+  - `aggregateUsage(range)`：支持 today / 7d / 30d，返回时间桶 + byFamily + byProvider + totals + peak
+  - admin API `/admin/usage/:range`；CLI 按键 `u` 进用量视图（纯 Unicode sparkline，可切时间范围）
+  - 配套测试：usage / footer-status
 
 ## [3.1.0] - 2026-06-17
 

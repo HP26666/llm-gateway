@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { BlockList, isIP } from "node:net";
 
 import { saveConfig as defaultSaveConfig, shortId } from "./config.mjs";
 import {
@@ -6,6 +7,8 @@ import {
   findProviderBaseUrl,
   findProviderKey,
   findProviderModel,
+  getAllQuads,
+  getPrimaryQuad,
   logBaseUrlChange,
   logFamilySwitch,
   logKeyChange,
@@ -15,6 +18,7 @@ import {
   logRaw,
 } from "./route-utils.mjs";
 import { checkPortFree, findPortOccupant, isValidPort, killProcess } from "./port-utils.mjs";
+import { aggregateUsage, cleanupOldUsageFiles } from "./usage-store.mjs";
 
 const DEFAULT_MAX_BODY_SIZE = 50 * 1024 * 1024;
 const MAX_HISTORY_ITEMS = 200;
@@ -140,6 +144,80 @@ function ensureLoopbackRequest(req) {
   }
 }
 
+// 常量时间字符串比较,避免 token 校验的 timing 侧信道。
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) {
+    return false;
+  }
+  return timingSafeEqual(ab, bb);
+}
+
+// admin 鉴权(回环之上):config.gateway.adminToken 非空时,要求 X-Admin-Token 头匹配。
+// adminToken 为 null 时维持现状(只靠回环 IP)——向后兼容,不破坏现有 CLI/调用。
+// 不匹配 throw HttpError(401)。
+function ensureAdminAuth(req, config) {
+  const expected = config?.gateway?.adminToken;
+  if (!expected) {
+    return;
+  }
+  const provided = req.headers["x-admin-token"];
+  const value = Array.isArray(provided) ? provided[0] : provided;
+  if (typeof value !== "string" || !safeEqual(value, expected)) {
+    throw new HttpError(401, "Invalid or missing admin token.");
+  }
+}
+
+// SSRF 防护:baseUrl 必须是公网 http(s)。
+// 拒绝:非 http(s) scheme、localhost、私网/链路本地/回环/保留段 IP。
+// 公网域名或公网 IP 放行。不做 DNS 解析(信任域名解析结果)——可预测性优先的取舍;
+// 将来接本地模型可加 allowPrivateBaseUrl 开关,在此处短路。
+const SSRF_BLOCKLIST = (() => {
+  const bl = new BlockList();
+  bl.addAddress("127.0.0.1", "ipv4");
+  bl.addRange("10.0.0.0", "10.255.255.255", "ipv4");
+  bl.addRange("172.16.0.0", "172.31.255.255", "ipv4");
+  bl.addRange("192.168.0.0", "192.168.255.255", "ipv4");
+  bl.addRange("169.254.0.0", "169.254.255.255", "ipv4");
+  bl.addRange("0.0.0.0", "0.255.255.255", "ipv4");
+  bl.addRange("100.64.0.0", "100.127.255.255", "ipv4");
+  bl.addAddress("::1", "ipv6");
+  bl.addRange("fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "ipv6");
+  bl.addRange("fe80::", "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "ipv6");
+  return bl;
+})();
+
+function assertSafeBaseUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new HttpError(400, `invalid baseUrl: ${rawUrl}`);
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new HttpError(400, `baseUrl scheme must be http or https (got ${parsed.protocol})`);
+  }
+
+  // WHATWG URL 的 hostname 对 IPv6 可能带方括号(如 [::1]),剥掉再做 IP 校验。
+  const host = parsed.hostname.toLowerCase().replace(/^\[|]$/g, "");
+  if (host === "localhost" || host === "localhost." || host.endsWith(".localhost")) {
+    throw new HttpError(400, "baseUrl must not point to localhost");
+  }
+
+  const family = isIP(host);
+  if (family === 0) {
+    return; // 公网域名,放行
+  }
+  if (SSRF_BLOCKLIST.check(host, family === 4 ? "ipv4" : "ipv6")) {
+    throw new HttpError(
+      400,
+      "baseUrl must not point to a private/loopback/link-local/reserved address",
+    );
+  }
+}
+
 function assertFamilyExists(config, family) {
   if (!(family in config.modelFamilies)) {
     throw new HttpError(404, "family not found");
@@ -178,52 +256,50 @@ function getProviderBaseUrl(provider, baseUrlId) {
   return baseUrl;
 }
 
+// 克隆主候选四元组（兼容旧单四元组与 candidates 列表形态）。history 快照用。
 function cloneBinding(binding) {
-  if (!binding) {
+  const quad = Array.isArray(binding?.candidates)
+    ? binding.candidates.find((q) => q && (q.providerId || q.baseUrlId || q.keyId || q.modelId))
+    : binding;
+  if (!quad) {
     return null;
   }
   return {
-    providerId: binding.providerId ?? null,
-    baseUrlId: binding.baseUrlId ?? null,
-    modelId: binding.modelId ?? null,
-    keyId: binding.keyId ?? null,
+    providerId: quad.providerId ?? null,
+    baseUrlId: quad.baseUrlId ?? null,
+    modelId: quad.modelId ?? null,
+    keyId: quad.keyId ?? null,
   };
 }
 
-function ensureProviderNotReferenced(config, providerId) {
-  const family = Object.entries(config.modelFamilies).find(
-    ([, binding]) => binding.providerId === providerId,
-  );
-  if (family) {
-    throw new HttpError(409, `provider is used by family ${family[0]}`);
+// 在所有 family 的全部候选中查找满足 predicate 的引用（兼容多候选 schema）。
+function findFamilyReferencing(config, predicate) {
+  for (const family of Object.keys(config.modelFamilies)) {
+    for (const quad of getAllQuads(config, family)) {
+      if (predicate(quad)) return family;
+    }
   }
+  return null;
+}
+
+function ensureProviderNotReferenced(config, providerId) {
+  const family = findFamilyReferencing(config, (q) => q.providerId === providerId);
+  if (family) throw new HttpError(409, `provider is used by family ${family}`);
 }
 
 function ensureKeyNotReferenced(config, providerId, keyId) {
-  const family = Object.entries(config.modelFamilies).find(
-    ([, binding]) => binding.providerId === providerId && binding.keyId === keyId,
-  );
-  if (family) {
-    throw new HttpError(409, `key is used by family ${family[0]}`);
-  }
+  const family = findFamilyReferencing(config, (q) => q.providerId === providerId && q.keyId === keyId);
+  if (family) throw new HttpError(409, `key is used by family ${family}`);
 }
 
 function ensureModelNotReferenced(config, providerId, modelId) {
-  const family = Object.entries(config.modelFamilies).find(
-    ([, binding]) => binding.providerId === providerId && binding.modelId === modelId,
-  );
-  if (family) {
-    throw new HttpError(409, `model is used by family ${family[0]}`);
-  }
+  const family = findFamilyReferencing(config, (q) => q.providerId === providerId && q.modelId === modelId);
+  if (family) throw new HttpError(409, `model is used by family ${family}`);
 }
 
 function ensureBaseUrlNotReferenced(config, providerId, baseUrlId) {
-  const family = Object.entries(config.modelFamilies).find(
-    ([, binding]) => binding.providerId === providerId && binding.baseUrlId === baseUrlId,
-  );
-  if (family) {
-    throw new HttpError(409, `baseUrl is used by family ${family[0]}`);
-  }
+  const family = findFamilyReferencing(config, (q) => q.providerId === providerId && q.baseUrlId === baseUrlId);
+  if (family) throw new HttpError(409, `baseUrl is used by family ${family}`);
 }
 
 function summarizeMetrics(metrics, family) {
@@ -248,6 +324,7 @@ function sanitizeConfig(config) {
       host: config.gateway.host,
       port: config.gateway.port,
       sharedToken: config.gateway.sharedToken ? maskSecret(config.gateway.sharedToken) : null,
+      adminToken: config.gateway.adminToken ? maskSecret(config.gateway.adminToken) : null,
     },
     providers: Object.fromEntries(
       Object.entries(config.providers).map(([providerId, provider]) => [
@@ -290,14 +367,15 @@ function createModelId(providerId) {
 }
 
 function pushHistory(config, family, previous, current, source = "ui") {
+  const currentQuad = cloneBinding(current) || {};
   const entry = {
     id: randomUUID(),
     ts: new Date().toISOString(),
     family,
-    providerId: current.providerId,
-    baseUrlId: current.baseUrlId,
-    modelId: current.modelId,
-    keyId: current.keyId,
+    providerId: currentQuad.providerId ?? null,
+    baseUrlId: currentQuad.baseUrlId ?? null,
+    modelId: currentQuad.modelId ?? null,
+    keyId: currentQuad.keyId ?? null,
     previous: cloneBinding(previous),
     current: cloneBinding(current),
     from: describeBinding(config, previous),
@@ -352,6 +430,7 @@ async function handleCreateProvider(config, req, res) {
   const baseUrls = [];
   const legacyBaseUrl = trimTrailingSlash(normalizeString(body.baseUrl || body.url || ""));
   if (legacyBaseUrl) {
+    assertSafeBaseUrl(legacyBaseUrl);
     baseUrls.push({
       id: shortId(`b_${providerId}`),
       url: legacyBaseUrl,
@@ -431,6 +510,7 @@ async function handleAddBaseUrl(config, providerId, req, res) {
   const provider = getProvider(config, providerId);
   const body = await readJsonBody(req);
   const url = trimTrailingSlash(normalizeString(body.url, "url"));
+  assertSafeBaseUrl(url);
   const baseUrl = {
     id: shortId(`b_${providerId}`),
     url,
@@ -449,7 +529,9 @@ async function handleUpdateBaseUrl(config, providerId, baseUrlId, req, res) {
   const source = getRequestSource(req);
 
   if (body.url !== undefined) {
-    baseUrl.url = trimTrailingSlash(normalizeString(body.url, "url"));
+    const nextUrl = trimTrailingSlash(normalizeString(body.url, "url"));
+    assertSafeBaseUrl(nextUrl);
+    baseUrl.url = nextUrl;
   }
   if (body.note !== undefined) {
     baseUrl.note = normalizeOptionalString(body.note);
@@ -572,24 +654,75 @@ async function handleSwitchFamily(config, family, req, res) {
   getProviderModel(provider, modelId);
   getProviderKey(provider, keyId);
 
-  const previous = cloneBinding(config.modelFamilies[family]);
-  const previousLabel = describeBinding(config, previous);
-  config.modelFamilies[family] = { providerId, baseUrlId, modelId, keyId };
+  const previousBinding = config.modelFamilies[family];
+  const previousLabel = describeBinding(config, previousBinding);
+  // PUT 单四元组 = 重置 candidates 为单候选；保留原 strategy / circuitBreaker。
+  const existing = previousBinding && typeof previousBinding === "object" ? previousBinding : {};
+  const strategy = existing.strategy || "failover";
+  const circuitBreaker = existing.circuitBreaker ?? null;
+  config.modelFamilies[family] = {
+    candidates: [{ providerId, baseUrlId, modelId, keyId }],
+    strategy,
+    circuitBreaker,
+  };
   const source = getRequestSource(req);
-  pushHistory(config, family, previous, config.modelFamilies[family], source);
+  pushHistory(config, family, previousBinding, config.modelFamilies[family], source);
   const currentLabel = describeBinding(config, config.modelFamilies[family]);
 
   await persist(config, 200, { ok: true }, res);
   logFamilySwitch({ family, fromLabel: previousLabel, toLabel: currentLabel, source });
 }
 
+// PUT /admin/families/:family/candidates —— 替换整个候选列表 + 策略（保留原 circuitBreaker）。
+// body: { candidates: [{providerId,baseUrlId,keyId,modelId}, ...], strategy }
+async function handleSetFamilyCandidates(config, family, req, res) {
+  assertFamilyExists(config, family);
+  const body = await readJsonBody(req);
+  const rawCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+
+  const validated = [];
+  for (const entry of rawCandidates) {
+    if (!entry || typeof entry !== "object") continue;
+    const providerId = normalizeString(entry.providerId, "providerId");
+    const baseUrlId = normalizeString(entry.baseUrlId, "baseUrlId");
+    const keyId = normalizeString(entry.keyId, "keyId");
+    const modelId = normalizeString(entry.modelId, "modelId");
+    const provider = getProvider(config, providerId);
+    getProviderBaseUrl(provider, baseUrlId);
+    getProviderKey(provider, keyId);
+    getProviderModel(provider, modelId);
+    validated.push({ providerId, baseUrlId, keyId, modelId });
+  }
+
+  const strategy = ["failover", "round_robin", "weighted"].includes(body.strategy)
+    ? body.strategy
+    : "failover";
+
+  const previousBinding = config.modelFamilies[family];
+  const previousLabel = describeBinding(config, previousBinding);
+  const circuitBreaker = previousBinding?.circuitBreaker ?? null;
+  config.modelFamilies[family] = { candidates: validated, strategy, circuitBreaker };
+  const source = getRequestSource(req);
+  const currentLabel = describeBinding(config, config.modelFamilies[family]);
+
+  await persist(config, 200, { ok: true, family, candidateCount: validated.length, strategy }, res);
+  logFamilySwitch({ family, fromLabel: previousLabel, toLabel: currentLabel, source });
+}
+
 function buildFamilyStatus(config, metrics, family) {
   assertFamilyExists(config, family);
+  const binding = config.modelFamilies[family] || {};
+  const primary = getPrimaryQuad(binding) || {};
   return {
     family,
     route: {
-      ...config.modelFamilies[family],
-      label: describeBinding(config, config.modelFamilies[family]),
+      providerId: primary.providerId ?? null,
+      baseUrlId: primary.baseUrlId ?? null,
+      modelId: primary.modelId ?? null,
+      keyId: primary.keyId ?? null,
+      label: describeBinding(config, binding),
+      candidateCount: getAllQuads(config, family).length,
+      strategy: binding.strategy || "failover",
     },
     stats: summarizeMetrics(metrics, family),
   };
@@ -597,6 +730,18 @@ function buildFamilyStatus(config, metrics, family) {
 
 async function handleGetFamilyStatus(config, metrics, family, res) {
   writeJson(res, 200, buildFamilyStatus(config, metrics, family));
+}
+
+// GET /admin/usage/:range —— 聚合用量统计。range: today|7d|30d（非法值降级为 today）。
+// 顺带惰性清理超过保留期的旧文件（usage-store 内部每 6h 最多跑一次）。
+async function handleGetUsage(range, res) {
+  try {
+    await cleanupOldUsageFiles();
+    const data = await aggregateUsage(range || "today");
+    writeJson(res, 200, data);
+  } catch (err) {
+    throw new HttpError(500, `usage aggregation failed: ${err.message}`);
+  }
 }
 
 async function handleProbePort(config, req, res) {
@@ -779,6 +924,7 @@ function decodeAdminSegments(pathname) {
 export async function handleAdmin({ config, metrics, req, res, pathname, runtime, getHealthPayload }) {
   try {
     ensureLoopbackRequest(req);
+    ensureAdminAuth(req, config);
 
     const segments = decodeAdminSegments(pathname);
 
@@ -794,6 +940,11 @@ export async function handleAdmin({ config, metrics, req, res, pathname, runtime
 
     if (req.method === "GET" && segments.length === 1 && segments[0] === "history") {
       writeJson(res, 200, { history: config.history });
+      return;
+    }
+
+    if (req.method === "GET" && segments.length === 2 && segments[0] === "usage") {
+      await handleGetUsage(segments[1], res);
       return;
     }
 
@@ -888,6 +1039,11 @@ export async function handleAdmin({ config, metrics, req, res, pathname, runtime
 
       if (segments.length === 2 && req.method === "PUT") {
         await handleSwitchFamily(config, family, req, res);
+        return;
+      }
+
+      if (segments.length === 3 && segments[2] === "candidates" && req.method === "PUT") {
+        await handleSetFamilyCandidates(config, family, req, res);
         return;
       }
 
