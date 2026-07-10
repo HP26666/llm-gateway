@@ -13,7 +13,8 @@
 // getBreakerState / record* 调用时惰性判定（Date.now() - openedAt >= coolDownMs）。
 
 export const CIRCUIT_BREAKER_DEFAULTS = Object.freeze({
-  failureThreshold: 5,
+  // 3（非 5）：hang 型故障经 TTFB 识别后更快进 OPEN，减少前几个请求的卡顿窗口。
+  failureThreshold: 3,
   coolDownMs: 60_000,
   successThreshold: 1,
 });
@@ -108,6 +109,16 @@ function forceHalfOpen(key) {
   const b = ensureBreaker(key);
   b.status = "HALF_OPEN";
   b.successCount = 0;
+}
+
+// 直接强制 OPEN：用于连接失败（ECONNREFUSED 等不可达错误）——provider 挂了不会自愈，
+// 1 次就熔断，让 orderCandidates 立即跳过，下一个请求无需再试。与 forceHalfOpen 对称。
+export function forceOpen(key, params = {}) {
+  const p = mergeParams(params);
+  const b = ensureBreaker(key);
+  b.status = "OPEN";
+  b.openedAt = Date.now();
+  b.failureCount = Math.max(b.failureCount, p.failureThreshold);
 }
 
 // 排查 / 可视化快照（只读视角，含惰性刷新后的状态）。

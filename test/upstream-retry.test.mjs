@@ -92,7 +92,7 @@ test("429 返回时不会被 500 包装（V5.1 回归 P0 #1）", async (t) => {
 
 // V5.2 §5.2 / §5.3 / §6.2：完整终态 429 pass-through 链路。
 // - upstream 永远返回 429 + Retry-After: 0.01（10ms 间隔）
-// - 走完整 10 次 rate-limit 预算
+// - 走完整 1 次 rate-limit 预算（V5.3 起 429 单候选只重试 1 次）
 // - 终态 429 必须以 response 形式返回，body 保持未消费
 // - 调用方拿到 response 后能用 response.json() / response.text() 读出 body
 // - getLastUpstreamError 必须是 rate-limited，不能是 api-error
@@ -104,7 +104,7 @@ test("V5.2 完整终态 429 pass-through: status=429, body 可读, rate-limited"
     count += 1;
     res.writeHead(429, {
       "content-type": "application/json",
-      "retry-after": "0.01", // 10ms，10 次 ≈ 100ms
+      "retry-after": "0.01", // 10ms 间隔
     });
     res.end(JSON.stringify({ error: { type: "rate_limit", message: "slow down" } }));
   });
@@ -124,7 +124,7 @@ test("V5.2 完整终态 429 pass-through: status=429, body 可读, rate-limited"
   const bodyText = await response.text();
   assert.match(bodyText, /slow down/, `body should be readable, got: ${bodyText}`);
 
-  // 3) upstream 被命中 11 次（1 + 10 retries）
+  // 3) upstream 被命中 2 次（1 + 1 retry，V5.3 起 429 单候选只重试 1 次）
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(count, 11, `expected 11 hits (1 + 10 retries), got ${count}`);
+  assert.equal(count, 2, `expected 2 hits (1 + 1 retry), got ${count}`);
 });

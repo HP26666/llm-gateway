@@ -13,6 +13,8 @@ import {
 } from "./route-utils.mjs";
 import {
   breakerKey,
+  forceOpen,
+  getBreakerState,
   orderCandidates,
   recordBreakerFailure,
   recordBreakerSuccess,
@@ -51,11 +53,21 @@ const RETRYABLE_TRANSPORT_STATUS = new Set([502, 503, 504]);
 const FAILOVER_TRIGGER_STATUS = new Set([401, 402, 403, 429]);
 const DEFAULT_MAX_BODY_SIZE = 50 * 1024 * 1024;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 120_000;
+// 首字节（response headers）超时：上游 headers 在此时长内未到达即判失败（典型 GLM 限额 hang）。
+// fetchWithRetry 识别 TTFB 超时后不重试、直接抛，由 tryWithFailover 切到副候选。
+// 30s（非 15s）：大上下文请求冷缓存时 pre-fill（处理全部输入 token）可能 >15s，
+// 15s 会把正常的慢启动误判为 hang 而误杀。30s 覆盖绝大多数冷缓存场景；真 hang 时
+// 等待翻倍但配合熔断器（failureThreshold=3）仍可在合理时间内切换，可接受。
+const DEFAULT_TTFB_TIMEOUT_MS = 30_000;
 // 普通重试预算（fetch error / 502/503/504）独立计数：V5.1 §5.1
 const DEFAULT_GENERIC_MAX_RETRIES = 3;
 // 429 重试预算独立计数：V5.1 §5.1
-const RATE_LIMIT_MAX_RETRIES = 10;
+// V5.3: 429 只重试 1 次——在有 failover 候选的场景下，重复打同一个被限流的上游
+// 毫无意义，应尽快切到下一个候选。剩余重试预算留给同候选的可能恢复。
+const RATE_LIMIT_MAX_RETRIES = 1;
 const RATE_LIMIT_RETRY_DELAY_MS = 5_000;
+// 429 只重试 1 次即视为失败→通知熔断器，让 orderCandidates 直接跳过此候选。
+const BREAKER_429_RETRY_THRESHOLD = 1;
 const DEFAULT_RETRY_BASE_MS = 1000;
 
 export class GatewayHttpError extends Error {
@@ -65,6 +77,35 @@ export class GatewayHttpError extends Error {
     this.statusCode = statusCode;
     this.type = type;
   }
+}
+
+// TTFB 超时专用错误。作为 controller.abort(reason) 的 reason 注入，fetchWithRetry catch 块
+// 通过 controller.signal.reason 识别它（reason 不在 fetch 抛出的 AbortError 上，必须读 signal.reason）。
+class TtfbTimeoutError extends Error {
+  constructor(ms) {
+    super(`upstream TTFB timeout after ${ms}ms (headers not received)`);
+    this.name = "TtfbTimeoutError";
+    this.code = "TTFB_TIMEOUT";
+  }
+}
+
+// 连接类错误：provider 不可达/挂了，毫秒级失败且不会自愈，重试毫无意义。
+// 识别方式：fetch TypeError 的 cause.code（undici 底层 libuv 错误码）。涵盖 TCP/DNS/路由变体。
+const CONNECTION_ERROR_CODES = new Set([
+  "ECONNREFUSED",   // TCP connect 被拒（端口不通 = 进程挂了）
+  "ECONNRESET",     // 连接被对端重置
+  "ENOTFOUND",      // DNS 解析失败（域名不存在）
+  "ETIMEDOUT",      // 连接超时（不可路由的 IP）
+  "EHOSTUNREACH",   // 主机不可达
+  "ENETUNREACH",    // 网络不可达
+  "EAI_AGAIN",      // DNS 临时失败（可重试，但通常持续）
+  "EAI_NONAME",     // DNS 名称不存在
+  "EAI_FAIL",       // DNS 永久失败
+  "ECONNABORTED",   // 连接中止
+]);
+function isConnectionError(error) {
+  const code = error?.cause?.code;
+  return typeof code === "string" && CONNECTION_ERROR_CODES.has(code);
 }
 
 function trimTrailingSlash(value) {
@@ -107,10 +148,11 @@ function getRetryAfterMs(response) {
 //
 // 返回值:最终 response（可能是终态 4xx/5xx/429），不再 throw fetch 错误（由调用方感知）。
 // 真正 fetch 失败时抛 lastError。
-export async function fetchWithRetry(url, options, route = null) {
+export async function fetchWithRetry(url, options, route = null, { breakerNotify, ttfbTimeoutMs = DEFAULT_TTFB_TIMEOUT_MS } = {}) {
   let lastError = null;
   let genericRetryCount = 0;
   let rateLimitRetryCount = 0;
+  let breakerNotified = false;
 
   // 防御性兜底：while(true) 里若代码出 bug 也得能跳出
   const hardCap = DEFAULT_GENERIC_MAX_RETRIES + RATE_LIMIT_MAX_RETRIES + 50;
@@ -122,13 +164,44 @@ export async function fetchWithRetry(url, options, route = null) {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), DEFAULT_UPSTREAM_TIMEOUT_MS);
+    // 双 timer 共用同一 controller：TTFB 先到点先 abort 并带 TtfbTimeoutError reason；
+    // 总超时兜底覆盖 headers 阶段。fetch resolve（headers 到达）后两个都清，避免 totalTimer 泄漏。
+    const ttfbTimer = setTimeout(
+      () => controller.abort(new TtfbTimeoutError(ttfbTimeoutMs)),
+      ttfbTimeoutMs,
+    );
+    const totalTimer = setTimeout(
+      () => controller.abort(new Error("upstream total timeout")),
+      DEFAULT_UPSTREAM_TIMEOUT_MS,
+    );
 
     let response;
     try {
       response = await fetch(url, { ...options, signal: controller.signal });
     } catch (error) {
-      clearTimeout(timeout);
+      clearTimeout(ttfbTimer);
+      clearTimeout(totalTimer);
+
+      // TTFB 超时（上游 headers 迟迟不来，典型 GLM 限额 hang）：不重试，直接抛，
+      // 由 tryWithFailover 切到副候选。abort reason 不在抛出的 AbortError 上，必须读 signal.reason。
+      const reason = controller.signal.reason;
+      if (reason instanceof TtfbTimeoutError) {
+        logRaw(`[warn][retry] TTFB timeout ${ttfbTimeoutMs}ms, not retrying, handing to failover`);
+        recordRouteUpstreamError(route, { kind: "ttfb-timeout", summary: `TTFB > ${ttfbTimeoutMs}ms` });
+        throw reason;
+      }
+
+      // 连接失败（ECONNREFUSED/ENOTFOUND 等）：provider 挂了/不可达，毫秒级返回且不会自愈。
+      // 重试毫无意义——不重试，直接抛给 tryWithFailover 切副候选，避免白等 7.5s 退避。
+      if (isConnectionError(error)) {
+        logRaw(`[warn][retry] connection error (${error.cause?.code}), not retrying, handing to failover`);
+        recordRouteUpstreamError(route, {
+          kind: "upstream-fetch",
+          summary: `connection error: ${error.cause?.code || error.message}`,
+        });
+        throw error;
+      }
+
       lastError = error;
 
       if (genericRetryCount < DEFAULT_GENERIC_MAX_RETRIES) {
@@ -146,7 +219,8 @@ export async function fetchWithRetry(url, options, route = null) {
       throw error;
     }
 
-    clearTimeout(timeout);
+    clearTimeout(ttfbTimer);
+    clearTimeout(totalTimer);
 
     // 429 走专用分支
     if (response.status === 429) {
@@ -164,9 +238,18 @@ export async function fetchWithRetry(url, options, route = null) {
       }
 
       rateLimitRetryCount += 1;
-      const delay = getRetryAfterMs(response) ?? RATE_LIMIT_RETRY_DELAY_MS;
+      // 429 重试达到熔断阈值时，提前通知熔断器（不等 10 次耗尽），
+      // 让 tryWithFailover 的 orderCandidates 能更快跳过被限流的上游。
+      if (!breakerNotified && rateLimitRetryCount >= BREAKER_429_RETRY_THRESHOLD && typeof breakerNotify === "function") {
+        breakerNotified = true;
+        breakerNotify();
+      }
+      const rawDelay = getRetryAfterMs(response) ?? RATE_LIMIT_RETRY_DELAY_MS;
+      // V5.3: 在有 failover 候选的场景下，429 等太久无意义——上游限流通常持续。
+      // 最多等 10 秒就放弃本次重试，尽快切到下一个 provider。
+      const delay = Math.min(rawDelay, 10_000);
       logRaw(
-        `[warn][retry] 429 rate limited, attempt ${rateLimitRetryCount}/${RATE_LIMIT_MAX_RETRIES}, waiting ${Math.round(delay)}ms`,
+        `[warn][retry] 429 rate limited, attempt ${rateLimitRetryCount}/${RATE_LIMIT_MAX_RETRIES}, waiting ${Math.round(delay)}ms (capped from ${Math.round(rawDelay)}ms)`,
       );
       // 429 进度更新也记：CLI footer 在 60s 窗口内能体现进度
       recordRouteUpstreamError(route, {
@@ -476,6 +559,54 @@ function mergeBreakerParams(globalCB, familyCB) {
   return { ...(globalCB || {}), ...(familyCB || {}) };
 }
 
+// ===== HALF_OPEN 惰性探活 =====
+// 探活并发去重：同 key 的探活共享一次进行中的 Promise，避免多请求并发时重复打上游。
+const inflightProbes = new Map();
+const PROBE_TTFB_TIMEOUT_MS = 10_000;
+
+// 对 HALF_OPEN 候选发起极简探活（独立 fetch，不走 fetchWithRetry：无重试、无 usage、无嗅探）。
+// POST {upstreamUrl}/v1/messages，body 极简。2xx 或非 429 的 4xx → 上游活着（在正常响应）；
+// 5xx / 429 / TTFB 超时 / 网络错误 → 仍不可用。
+async function probeCandidateOnce(route) {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new TtfbTimeoutError(PROBE_TTFB_TIMEOUT_MS)),
+    PROBE_TTFB_TIMEOUT_MS,
+  );
+  const headers = new Headers();
+  headers.set(route.providerConfig.authHeader, buildAuthHeaderValue(route.providerConfig, route.key));
+  headers.set("content-type", "application/json");
+  headers.set("anthropic-version", "2023-06-01");
+  try {
+    const res = await fetch(joinUrl(route.upstreamUrl, "/v1/messages"), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: route.upstreamModel,
+        max_tokens: 1,
+        messages: [{ role: "user", content: "." }],
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+    return res.status < 500 && res.status !== 429;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 带并发去重的探活入口：同 key 并发请求共享同一 Promise。
+async function probeCandidate(route) {
+  const k = breakerKey(route);
+  const existing = inflightProbes.get(k);
+  if (existing) return existing;
+  const p = probeCandidateOnce(route).finally(() => inflightProbes.delete(k));
+  inflightProbes.set(k, p);
+  return p;
+}
+
 // failover 循环：在候选间换上游。首字节前（response header 阶段）才切；
 // 拿到非触发集响应即返回，后续 pipe 阶段不再 failover（防重复/乱码 token）。
 // 返回 { route, response }（可用响应，或透传最后一个失败响应保留真实上游错误）
@@ -496,6 +627,32 @@ async function tryWithFailover({ resolved, pathname, req, body, breakerParams, u
   let lastResponse = null;
 
   for (const route of candidates) {
+    // HALF_OPEN 惰性探活：冷却到期时先轻量确认恢复，不拿用户大请求当探活炮灰。
+    const breakerK = breakerKey(route);
+    if (getBreakerState(breakerK, breakerParams) === "HALF_OPEN") {
+      const ok = await probeCandidate(route);
+      if (ok) {
+        recordBreakerSuccess(breakerK, breakerParams); // HALF_OPEN → CLOSED
+        logRaw(`[info][breaker] probe ok ${route.providerId}:${route.upstreamModel}, HALF_OPEN→CLOSED`);
+      } else {
+        recordBreakerFailure(breakerK, breakerParams); // HALF_OPEN → OPEN，刷新 openedAt 重新冷却
+        logFailoverSwitch({
+          family: route.modelFamily,
+          fromProvider: route.providerId,
+          toProvider: "(next)",
+          status: "probe-fail",
+          reason: "probe failed",
+        });
+        // 记录有意义的 lastError，避免全候选 probe-fail 时抛 "no candidates and no error"。
+        // 不覆盖已有的 lastError/lastResponse（fetch 失败/5xx 透传优先级更高）。
+        if (!lastError && !lastResponse) {
+          lastError = new Error(`probe failed for ${route.providerId}:${route.upstreamModel} (HALF_OPEN)`);
+          lastRoute = route;
+        }
+        continue; // 走副候选
+      }
+    }
+
     // 每个候选用自己的 upstreamModel 重组 body（不同上游模型名可能不同）
     const upstreamBody = JSON.stringify({ ...body, model: route.upstreamModel });
     let response;
@@ -504,9 +661,18 @@ async function tryWithFailover({ resolved, pathname, req, body, breakerParams, u
         method: "POST",
         headers: copyRequestHeaders(req, route.providerConfig, route.key),
         body: upstreamBody,
-      }, route);
+      }, route, {
+        breakerNotify: () => recordBreakerFailure(breakerKey(route), breakerParams),
+        ttfbTimeoutMs: breakerParams?.ttfbTimeoutMs,
+      });
     } catch (error) {
-      recordBreakerFailure(breakerKey(route), breakerParams);
+      // 连接失败（ECONNREFUSED 等不可达）：provider 挂了不会自愈，1 次即熔断（forceOpen），
+      // 让 orderCandidates 在下一个请求直接跳过此候选。其他失败仍走累计计数。
+      if (isConnectionError(error)) {
+        forceOpen(breakerKey(route), breakerParams);
+      } else {
+        recordBreakerFailure(breakerKey(route), breakerParams);
+      }
       logFailoverSwitch({
         family: route.modelFamily,
         fromProvider: route.providerId,
