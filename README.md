@@ -1,24 +1,31 @@
 # LLM Gateway
 
-零运行时依赖的本地 LLM 网关，兼容 Claude Code 需要的 Anthropic 接口，把 `opus` / `sonnet` / `sonnet[1m]` / `haiku` 四个模型族路由到任意上游 Provider（如 GLM、Kimi、DeepSeek）。
+零运行时依赖的本地 LLM 网关，同时兼容 **Anthropic Messages API**（`/v1/messages`，供 Claude Code）和 **OpenAI Responses API**（`/v1/responses`，供 Codex），把 `opus` / `sonnet` / `sonnet[1m]` / `haiku` 四个模型族路由到任意上游 Provider（如 GLM、Kimi、DeepSeek）。
 
-**只有一种启动方式**：启动后自动启动网关，然后进入交互式 CLI 界面，所有配置都在 CLI 内完成。
+支持多候选 failover、熔断器、用量统计，所有配置都在交互式 CLI 内完成。
 
 ## 目录结构
 
 ```
 llm-gateway/
-├── main.mjs             # 唯一入口：端口冲突处理 → 启动 runtime → CLI
-├── server.mjs           # 请求处理：/v1/messages 代理、/admin/* 内部 API、/health
-├── gateway-runtime.mjs  # HTTP 服务生命周期（start/close/preparePortSwitch）
-├── config.mjs           # data/gateway.json 加载/原子保存/v2→v3 迁移/BOM 容错
-├── admin.mjs            # /admin/* 内部 API（仅 127.0.0.1，供 CLI/脚本调用）
-├── route-utils.mjs      # 路由解析 + 终端日志缓存（emitLog/suppressConsole）
-├── port-utils.mjs       # 跨平台端口探测、占用进程查询、杀进程
-├── cli.mjs              # 终端 CLI（与 runtime 同进程）
-├── data/gateway.json    # 运行时配置（首次启动自动生成）
-├── sgw.bat              # Windows 一键启动
-└── archive/             # 旧版本归档（不再运行）
+├── main.mjs                      # 唯一入口：端口冲突处理 → 启动 runtime → CLI
+├── server.mjs                    # 请求处理：/v1/messages、/v1/responses 代理、/admin/*、/health
+├── gateway-runtime.mjs           # HTTP 服务生命周期（start/close/preparePortSwitch）
+├── config.mjs                    # data/gateway.json 加载/原子保存/迁移
+├── admin.mjs                     # /admin/* 内部 API + adminToken 鉴权 + SSRF 防护
+├── route-utils.mjs               # 路由解析 + 多候选 + 终端日志缓存
+├── port-utils.mjs                # 跨平台端口探测、占用进程查询、杀进程
+├── circuit-breaker.mjs           # 上游候选熔断器（三态机，被动统计）
+├── usage-store.mjs               # 用量统计（按天 jsonl + 聚合）
+├── debug-log.mjs                 # 问题级日志自动持久化
+├── responses-protocol.mjs        # Responses API SSE 序列化/解析
+├── responses-request-adapter.mjs # Responses → Anthropic 请求转换
+├── responses-response-adapter.mjs# Anthropic → Responses 响应转换
+├── cli.mjs                       # 终端 CLI（与 runtime 同进程）
+├── cli-select.mjs                # 方向键高亮选择器原语
+├── data/gateway.json             # 运行时配置（首次启动自动生成）
+├── sgw.bat                       # Windows 一键启动
+└── docs/                         # 架构/设计文档
 ```
 
 ## 运行要求
@@ -57,7 +64,7 @@ Claude gateway listening on http://127.0.0.1:8000 | families: opus->glm:glm-5.1,
 
 ## CLI 主界面
 
-主界面只显示三类信息：监听地址、四个 family 的当前路由、Provider 概览。**默认不显示日志/历史**，避免视觉过载。状态栏只显示中性提示（`状态: 就绪` / `状态: 上次操作成功`），失败时才显示错误信息。
+主界面只显示三类信息：监听地址、四个 family 的当前路由、Provider 概览。**默认不显示日志/历史**，避免视觉过载。
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -77,21 +84,13 @@ Claude gateway listening on http://127.0.0.1:8000 | families: opus->glm:glm-5.1,
 
 命令（数字/字母直接执行 · 方向键移动 · 回车确认高亮 · r 刷新 · q 退出 · Esc 回顶部）
   1=新建Provider    2=BaseUrl         3=Key            4=Model
-  5=切换Family      6=修改端口        7=历史           8=日志
-  9=导出            0=删除Provider    r=刷新           q=退出
+  5=Family候选      6=修改端口        7=历史           8=日志
+  9=导出            0=删除Provider    u=用量           q=退出
 ```
 
-**命令面板支持方向键高亮选择**：↑↓←→ 在 3×4 网格中移动高亮（跨行/跨列），回车执行当前高亮项。数字 `1`~`9`/`0` 和 `r`/`q` **直接执行**对应命令（无需回车）。`Esc` 或 `Ctrl-C` 回主界面顶部。非 TTY 环境自动降级回数字输入模式。
-
-所有显示都按视觉宽度截断，长 URL / 长 note 不会撑破边框。`2/3/4` 进入子菜单后也支持方向键选择：`1=新增 2=修改 3=删除 0=返回`。
+**命令面板支持方向键高亮选择**：↑↓←→ 在 3×4 网格中移动高亮（跨行/跨列），回车执行当前高亮项。数字 `1`~`9`/`0` 和 `r`/`u`/`q` **直接执行**对应命令（无需回车）。非 TTY 环境自动降级回数字输入模式。
 
 ### 命令说明
-
-以下操作方式同时生效，可混用：
-
-- **方向键** ↑↓←→ 移动高亮，回车执行高亮项
-- **数字/字母** `1`~`9`/`0`/`r`/`q` 直接执行对应命令
-- **`Esc` / `Ctrl-C`** 回主界面顶部
 
 | 键 | 动作 |
 |---|---|
@@ -99,29 +98,22 @@ Claude gateway listening on http://127.0.0.1:8000 | families: opus->glm:glm-5.1,
 | `2` | BaseUrl 子菜单（新增 / 修改 / 删除） |
 | `3` | Key 子菜单（新增 / 修改 / 删除） |
 | `4` | Model 子菜单（新增 / 修改 / 删除） |
-| `5` | 切换某个 family 的 `provider + baseUrl + key + model` |
+| `5` | **Family 候选编辑器**：追加/删除候选、设主候选（置顶）、切策略、熔断/TTFB 配置 |
 | `6` | 修改监听端口（事务式，失败时旧端口保留工作；占用时会询问是否杀进程） |
 | `7` | 查看历史（独立视图，回车返回） |
 | `8` | 查看最近网关日志（实时刷新视图，按 `q` / `Esc` / `Ctrl-C` 返回） |
-| `9` | 导出当前配置 JSON 到文件（默认写入 `data/export/`，也可自定义路径） |
+| `9` | 导出当前配置 JSON 到文件（默认写入 `data/export/`） |
 | `0` | 删除 Provider |
+| `u` | **用量统计视图**：Token 趋势 sparkline + 按 Family/Provider 分布，可切今日/7天/30天 |
 | `r` | 刷新 |
 | `q` | 退出 |
 
-多步文本输入流程（新建 provider、新增 baseUrl/key/model 等）中，任一步输入 `q` 可中途取消并返回主界面。
-
 ### 回退到纯数字模式
 
-若方向键选择器在任何终端下异常，可设环境变量一键回滚到原始数字输入模式：
+若方向键选择器在任何终端下异常，可设环境变量一键回滚：
 
 ```bash
 LLM_CLI_NO_KEYSELECT=1 node main.mjs
-```
-
-Windows：
-
-```bat
-set LLM_CLI_NO_KEYSELECT=1 && sgw.bat
 ```
 
 ## 配置数据模型（V3）
@@ -132,7 +124,8 @@ set LLM_CLI_NO_KEYSELECT=1 && sgw.bat
   "gateway": {
     "host": "127.0.0.1",
     "port": 8000,
-    "sharedToken": null
+    "sharedToken": null,
+    "adminToken": null
   },
   "providers": {
     "glm": {
@@ -141,23 +134,35 @@ set LLM_CLI_NO_KEYSELECT=1 && sgw.bat
       "authHeader": "Authorization",
       "authScheme": "Bearer",
       "baseUrls": [
-        { "id": "b_glm_xxx", "url": "https://open.bigmodel.cn/api/anthropic", "note": "主线路" },
-        { "id": "b_glm_yyy", "url": "https://proxy.example.com", "note": "代理" }
+        { "id": "b_glm_xxx", "url": "https://open.bigmodel.cn/api/anthropic", "note": "主线路" }
       ],
       "keys": [
         { "id": "k_glm_xxx", "token": "...", "note": "LSXkey", "createdAt": "..." }
       ],
       "models": [
-        { "id": "m_glm_xxx", "model": "glm-5.1", "name": "GLM 5.1" },
-        { "id": "m_glm_yyy", "model": "glm-4.7", "name": "GLM 4.7 备用" }
+        { "id": "m_glm_xxx", "model": "glm-5.1", "name": "GLM 5.1" }
       ]
     }
   },
+  "circuitBreaker": null,
   "modelFamilies": {
-    "opus":       { "providerId": "glm", "baseUrlId": "b_glm_xxx", "keyId": "k_glm_xxx", "modelId": "m_glm_xxx" },
-    "sonnet":     { "providerId": null,  "baseUrlId": null,         "keyId": null,         "modelId": null },
-    "sonnet[1m]": { "providerId": null,  "baseUrlId": null,         "keyId": null,         "modelId": null },
-    "haiku":      { "providerId": null,  "baseUrlId": null,         "keyId": null,         "modelId": null }
+    "opus": {
+      "candidates": [
+        { "providerId": "glm", "baseUrlId": "b_glm_xxx", "keyId": "k_glm_xxx", "modelId": "m_glm_xxx" }
+      ],
+      "strategy": "failover",
+      "circuitBreaker": null
+    },
+    "sonnet": {
+      "candidates": [
+        { "providerId": "glm", "baseUrlId": "b_glm_xxx", "keyId": "k_glm_xxx", "modelId": "m_glm_xxx" },
+        { "providerId": "deepseek", "baseUrlId": "b_ds_xxx", "keyId": "k_ds_xxx", "modelId": "m_ds_xxx" }
+      ],
+      "strategy": "round_robin",
+      "circuitBreaker": { "failureThreshold": 3, "coolDownMs": 60000, "successThreshold": 1, "ttfbTimeoutMs": 30000 }
+    },
+    "sonnet[1m]": { "candidates": [], "strategy": "failover", "circuitBreaker": null },
+    "haiku":      { "candidates": [], "strategy": "failover", "circuitBreaker": null }
   },
   "history": []
 }
@@ -165,17 +170,84 @@ set LLM_CLI_NO_KEYSELECT=1 && sgw.bat
 
 语义要点：
 
-- **Provider 名称唯一**：同名字 provider 只能存在一个（不区分大小写）。CLI/HTTP 创建时都会校验
-- **Provider 是聚合对象**：下面挂 `baseUrls`、`keys`、`models` 三类子资源，本身只是容器
-- **BaseUrl**：每个 provider 可有多条，每条带 `note`，方便区分线路/入口
-- **Key**：每个 provider 可有多把，每把带 `note`；key 不再有 `active` 字段，family 路由完全由 `binding.keyId` 决定
-- **Model**：每个 provider 可有多个；`model` 是真实发往上游的型号（如 `glm-5.1`），`name` 是给用户看到的显示名（如 `GLM 5.1 主用`）
-- **Family 绑定**：必须显式选择 `provider + baseUrl + key + model` 四元组；不存在"默认 baseUrl / 默认 key"概念
-- 启动时旧 V2 配置（单字段 `baseUrl`、`name+note` 的 model、缺 `baseUrlId` 的 family、含 `active` 的 key）会自动迁移到 V3
+- **Provider** 是聚合对象，下挂 `baseUrls`、`keys`、`models` 三类子资源；名称唯一（不区分大小写）
+- **Model**：`model` 是真实发往上游的型号（如 `glm-5.1`），`name` 是给用户看到的显示名
+- **Family 绑定**：每个 family 是 `{ candidates, strategy, circuitBreaker }` 对象
+  - `candidates`：四元组数组（provider + baseUrl + key + model），可多候选
+  - `strategy`：`failover`（主备）/ `round_robin`（轮转）/ `weighted`（预留）
+  - `circuitBreaker`：per-family 覆盖，`null` = 用全局默认
+- **向后兼容**：旧的单四元组形态（family 直接是 `{providerId,...}`）会自动包成 1 元素 candidates，零迁移
+
+## 多候选 failover + 熔断器
+
+每个 family 可绑定多个上游候选，按 strategy 调度。配合熔断器实现自动故障转移。
+
+### 熔断器（circuit-breaker.mjs）
+
+标准三态机 `CLOSED → OPEN → HALF_OPEN → CLOSED`：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `failureThreshold` | 3 | 连续失败几次后熔断（OPEN） |
+| `coolDownMs` | 60000 | 熔断冷却时间，过后进 HALF_OPEN 待探活 |
+| `successThreshold` | 1 | HALF_OPEN 期间成功几次后恢复（CLOSED） |
+| `ttfbTimeoutMs` | 30000 | 首字节超时，超时视为失败 |
+
+- **被动统计**：无定时器、无主动探测，不耗 API 额度；状态靠下次请求惰性判定
+- 模块级单例，按候选四元组 key 索引，**跨 family、跨热切换保留状态**
+- 连接失败（ECONNREFUSED/ENOTFOUND 等）**1 次即熔断**（`forceOpen`），不必累计到阈值
+- 顶层 `circuitBreaker` 设全局默认，per-family 的 `circuitBreaker` 可覆盖单字段
+
+### failover 触发集
+
+请求命中以下状态时自动切换到下一个候选：
+
+- `≥ 500`（服务端错误）
+- `429`（限流）
+- `401` / `402` / `403`（鉴权类，换候选可能有效）
+- fetch throw（网络不可达等）
+
+**不触发**：`400` / `404` 等请求格式错误（换哪个上游都一样错）。
+
+切换只在**首字节前**发生，流式响应阶段不再切换（防止 token 乱码）。全部候选失败时透传最后一个候选的真实状态码（不伪造 502）。
+
+## 用量统计
+
+每个请求完成时自动记录 token 用量，按天写入 `data/usage-YYYYMMDD.jsonl`（保留 30 天，每 6 小时惰性清理旧文件）。
+
+记录字段：`family` / `providerId` / `modelId` / `keyId` / `in` / `out` / `cacheR` / `cacheW` / `status` / `ms`。失败请求也记一条（token=0），保证错误率统计完整。recordUsage 异步落盘，失败不影响主请求。
+
+- **CLI 查看**：按键 `u` 进用量视图，支持今日/7天/30天切换，展示 Token 趋势 sparkline + 按 Family/Provider 分布
+- **Admin API**：`GET /admin/usage/:range`（range ∈ today | 7d | 30d）
+
+问题级日志（failover / 熔断 / 上游异常 / 连接失败 / 流中断）也会自动追加到 `data/debug-YYYYMMDD.log`（保留 7 天），不再依赖手动从 CLI `8=日志` 视图复制。
+
+## Responses API（Codex 接入）
+
+除 `/v1/messages`（Claude Code）外，网关还提供 `POST /v1/responses`（OpenAI Codex 协议），走完整的 family 路由 + failover + 熔断 + 用量统计链路。
+
+三个零依赖 adapter 完成双向转换：
+
+- `responses-request-adapter.mjs`：Responses 请求 → Anthropic 请求
+- `responses-response-adapter.mjs`：Anthropic 响应 → Responses 响应（含流式 SSE 状态机）
+- `responses-protocol.mjs`：SSE 序列化/解析
+
+### Codex 客户端配置
+
+`~/.codex/config.toml`：
+
+```toml
+[model_providers.gateway]
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+env_key = "GATEWAY_SHARED_TOKEN"
+```
+
+Codex 的 `model` 字段直接配 family 名（`opus` / `sonnet` / `haiku`）。要走 `sonnet[1m]` 需显式把 model 配成 `sonnet[1m]`（Codex 不发 1m 信号）。
 
 ## 模型族路由识别
 
-网关根据 Claude Code 发来的 `model` 字段做映射：
+网关根据客户端发来的 `model` 字段做映射：
 
 - `best` / `default` / `auto` → `opus`
 - `opus` / `claude-opus-...` → `opus`
@@ -191,24 +263,30 @@ set LLM_CLI_NO_KEYSELECT=1 && sgw.bat
 CLI 中执行任何配置变更（family 切换、端口切换等）**无需重启**：
 
 - family 切换：admin handler 直接修改共享 config 引用，下一次请求即生效
-- 端口切换（**两阶段事务**，V5.1）：runtime 不再直接改 config
-  - 实际流程：admin 调 `runtime.preparePortSwitch(newPort, { excludeSocket })` → 改 in-memory `config.gateway.port` → `saveConfig()` 落盘 → `tx.commit()` 推进 active server → 返回 200
-  - 失败补偿：saveConfig 失败 → 回滚 in-memory port + `tx.rollback()` → 返回 500 + details
-  - commit 失败 → 尝试回滚 config（再次 saveConfig）+ `tx.rollback()` → 返回 500 + details
+- 端口切换（**两阶段事务**）：runtime 不直接改 config
+  - 流程：admin 调 `runtime.preparePortSwitch(newPort)` → 改 in-memory port → `saveConfig()` 落盘 → `tx.commit()` 推进 active server → 返回 200
+  - 失败补偿：saveConfig 失败 → 回滚 in-memory port + `tx.rollback()` → 返回 500
   - 端口切换成功/失败后，admin 响应 200/500，runtime 与磁盘 config 始终一致
-  - 旧 PATCH 自占 socket 用 `excludeSocket` 排除，PATCH 响应能写回；旧 server 销毁走 socket tracking
 
 每次切换都会在终端和 `8=日志` 视图中留下 `[config-change]` 记录。
 
 ## Admin API（内部）
 
-所有 `/admin/*` 路由仅响应来自 `127.0.0.1` / `::1` / `::ffff:127.0.0.1` 的请求，不再要求任何 admin token。供 CLI 与脚本化场景使用。
+所有 `/admin/*` 路由仅响应来自 `127.0.0.1` / `::1` / `::ffff:127.0.0.1` 的回环请求。
+
+### 鉴权
+
+- **回环 IP 校验**：始终生效，只允许本机访问
+- **adminToken（可选）**：当 `gateway.adminToken` 非空时，还要求请求头 `X-Admin-Token` 匹配（`timingSafeEqual` 常量时间比较，防侧信道）。为 `null` 时只靠回环 IP，向后兼容。CLI 会自动注入该头。
+
+### 端点清单
 
 ```text
 GET    /admin/config
 GET    /admin/config/export
 GET    /admin/history
 GET    /admin/health
+GET    /admin/usage/:range                            → today | 7d | 30d
 
 POST   /admin/providers                                { name, baseUrl?, baseUrlNote?, apiKey?, keyNote? }
 PATCH  /admin/providers/:id                            { name? }
@@ -227,6 +305,7 @@ PATCH  /admin/providers/:id/models/:mid                { model?, name? }
 DELETE /admin/providers/:id/models/:mid
 
 PUT    /admin/families/:family                         { providerId, baseUrlId, keyId, modelId }
+PUT    /admin/families/:family/candidates              { candidates, strategy, circuitBreaker }
 GET    /admin/families/:family/status
 
 POST   /admin/runtime/port/probe                       { port }            → { free, occupant }
@@ -235,6 +314,13 @@ PATCH  /admin/runtime/port                             { port, killIfOccupied? }
 ```
 
 调用时建议附带 header `X-Admin-Source: cli` / `X-Admin-Source: script`，便于历史记录区分来源。
+
+## 安全
+
+- **回环绑定**：网关仅监听 `127.0.0.1`，不暴露外网
+- **adminToken 鉴权**：admin 接口可选 token 保护（见上）
+- **sharedToken**：`gateway.sharedToken` 非空时，客户端请求需带 `Authorization: Bearer <token>`
+- **SSRF 防护**：创建/修改 baseUrl 时校验，拦截私网段（10/172.16/192.168）、回环、链路本地（169.254）、CGN（100.64）等，只允许 http(s) 公网地址
 
 ## Claude Code 接入
 
@@ -246,7 +332,7 @@ PATCH  /admin/runtime/port                             { port, killIfOccupied? }
 }
 ```
 
-如果为网关本身设置了 `gateway.sharedToken`（可选），还需让 Claude Code 发送：
+如果设置了 `gateway.sharedToken`，还需：
 
 ```json
 {
@@ -256,22 +342,20 @@ PATCH  /admin/runtime/port                             { port, killIfOccupied? }
 }
 ```
 
-`sharedToken` 是 Claude Code 请求网关时使用的本地令牌。
+不要把 `ANTHROPIC_DEFAULT_*_MODEL` 指向上游 provider ID——保持 Claude 原生模型名，网关会自动路由。
 
 ## 终端日志
 
-启动 banner 和请求/配置变更日志都会被缓存到 CLI `8=日志` 视图（最近 200 条）。在 CLI 模式下，这些日志**默认不会直接打印到主界面**，避免抢屏；需要时按 `8` 进入实时日志视图查看。
+启动 banner 和请求/配置变更日志都会缓存到 CLI `8=日志` 视图（最近 200 条）。CLI 模式下默认不打印到主界面，需要时按 `8` 进入实时日志视图。
 
 ```text
 Claude gateway listening on http://127.0.0.1:8000 | families: opus->glm:glm-5.1, ...
 
 [2026-06-14T10:21:02.000Z] /v1/messages claude-sonnet-4-6 [sonnet] -> kimi:kimi-for-coding (200)
 
-[config-change] 2026-06-14T10:20:30.000Z family=opus from=GLM · glm-5.1 · 主线路 · default to=GLM · glm-4.7 · 代理 · LSXkey source=cli
+[config-change] 2026-06-14T10:20:30.000Z family=opus from=GLM · glm-5.1 to=GLM · glm-4.7 source=cli
 [config-change] 2026-06-14T10:22:00.000Z port from=8000 to=9000 source=cli
 ```
-
-日志默认不在 CLI 主界面显示，需要时按 `8` 查看。
 
 ## 健康检查
 
@@ -283,8 +367,6 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 ## 回退与备份
 
-- CLI `9=导出` 会把完整配置 JSON 写入文件；默认路径类似 `data/export/gateway-YYYYMMDD-HHMMSS.json`
-- 导出时可直接回车使用默认路径，输入 `q` 取消，也可输入目录或完整文件路径
-- `archive/` 保留了旧版本文件，仅供历史参考（不再运行）
+- CLI `9=导出` 把完整配置 JSON 写入 `data/export/gateway-YYYYMMDD-HHMMSS.json`（可自定义路径）
 - 旧版本 `data/gateway.json`（V1/V2）会在下次启动时自动迁移到 V3
 - 如需手动备份，直接复制 `data/gateway.json` 即可

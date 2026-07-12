@@ -17,6 +17,10 @@ gateway.env
 # 内部开发文档
 prompt/
 
+# AI 编码助手本地配置（不共享）
+.claude/
+CLAUDE.md
+
 # Node
 node_modules/
 
