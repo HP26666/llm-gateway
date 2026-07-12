@@ -403,18 +403,24 @@ export async function loadConfig() {
 }
 
 export function saveConfig(config) {
-  saveQueue = saveQueue.then(async () => {
-    const normalized = await writeConfigFile(config);
+  // ⚠️ .catch 兜底防"毒链":Promise.then 链一旦 rejected,后续每次
+  // saveQueue = saveQueue.then(...) 都会短路到 reject 分支,新写入回调永不执行。
+  // 上一次落盘失败(disk full / 权限 / rename 跨设备等)绝不能毒死后续写入。
+  // 调用方仍能拿到本次写入的 rejection(await 的是链上最新节点)。
+  saveQueue = saveQueue
+    .catch(() => {})
+    .then(async () => {
+      const normalized = await writeConfigFile(config);
 
-    for (const key of Object.keys(config)) {
-      if (!(key in normalized)) {
-        delete config[key];
+      for (const key of Object.keys(config)) {
+        if (!(key in normalized)) {
+          delete config[key];
+        }
       }
-    }
 
-    Object.assign(config, normalized);
-    return config;
-  });
+      Object.assign(config, normalized);
+      return config;
+    });
 
   return saveQueue;
 }

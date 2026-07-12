@@ -95,6 +95,10 @@ export function buildAdminHeaders(extra, token) {
   };
 }
 
+// 导出供测试驱动：setGatewayUrl 指向测试 server，api() 走真实 HTTP。
+// 生产代码里这两者由 startCli 内部设置，测试外不会被外部调用。
+export { api as _apiForTest, setGatewayUrl as _setGatewayUrlForTest, setAdminToken as _setAdminTokenForTest };
+
 async function api(path, options = {}) {
   const init = {
     method: options.method || "GET",
