@@ -149,9 +149,9 @@ test("V5.2 E2E 终态 429: status=429, body 可读, rate-limited 不被覆盖", 
   const body = await res.json();
   assert.equal(body.error.type, "rate_limit_error", `upstream body must pass through, got: ${JSON.stringify(body)}`);
 
-  // 3) upstream 被命中 11 次（1 + 10 retries）
+  // 3) upstream 被命中 2 次（1 + 1 retry，V5.3 起 429 单候选只重试 1 次）
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(upstream.getCount(), 11, `expected 11 hits (1 + 10 retries), got ${upstream.getCount()}`);
+  assert.equal(upstream.getCount(), 2, `expected 2 hits (1 + 1 retry), got ${upstream.getCount()}`);
 
   // 4) footer 必须是 rate-limited，不能被 api-error 覆盖
   const last = getLastUpstreamError(60_000);

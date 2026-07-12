@@ -227,6 +227,11 @@ function normalizeCircuitBreaker(cb) {
   if (Number.isFinite(Number(cb.successThreshold))) {
     out.successThreshold = Math.max(1, Number(cb.successThreshold));
   }
+  // TTFB 超时：上游 response headers 在此时长内未到达即判失败（GLM 限额 hang）。
+  // clamp [1000, 120000]——下限防误杀，上限不超过总超时（无意义）。缺省走 fetchWithRetry 默认 15000。
+  if (Number.isFinite(Number(cb.ttfbTimeoutMs))) {
+    out.ttfbTimeoutMs = Math.min(120_000, Math.max(1_000, Number(cb.ttfbTimeoutMs)));
+  }
 
   return Object.keys(out).length > 0 ? out : null;
 }

@@ -700,7 +700,11 @@ async function handleSetFamilyCandidates(config, family, req, res) {
 
   const previousBinding = config.modelFamilies[family];
   const previousLabel = describeBinding(config, previousBinding);
-  const circuitBreaker = previousBinding?.circuitBreaker ?? null;
+  // circuitBreaker：body 显式传了就用 body 的（null = 清除覆盖，用全局默认）；
+  // 没传（undefined）保持旧值回填，向后兼容。清洗由 saveConfig→normalizeConfig 完成。
+  const circuitBreaker = body.circuitBreaker === undefined
+    ? (previousBinding?.circuitBreaker ?? null)
+    : body.circuitBreaker;
   config.modelFamilies[family] = { candidates: validated, strategy, circuitBreaker };
   const source = getRequestSource(req);
   const currentLabel = describeBinding(config, config.modelFamilies[family]);

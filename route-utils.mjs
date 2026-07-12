@@ -1,6 +1,7 @@
 export const FAMILY_ORDER = ["opus", "sonnet", "sonnet[1m]", "haiku"];
 
 import { EventEmitter } from "node:events";
+import { isProblemLog, writeDebugLog } from "./debug-log.mjs";
 
 const LOG_BUFFER_LIMIT = 200;
 const logBuffer = [];
@@ -69,11 +70,15 @@ function appendLog(line) {
 }
 
 // 统一日志出口：始终入 buffer；非 CLI 模式才打印到 stdout。
+// 问题级日志（[error]/[warn]/[failover]/[info][breaker]）异步写 debug 文件，失败静默。
 function emitLog(line) {
   if (!suppressConsole) {
     console.log(line);
   }
   appendLog(line);
+  if (isProblemLog(line)) {
+    writeDebugLog(line);
+  }
 }
 
 export function getRecentLogs(limit = 50) {

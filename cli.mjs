@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { FAMILY_ORDER, getLastUpstreamError, getRecentLogs, setSuppressConsole, getPrimaryQuad } from "./route-utils.mjs";
+import { CIRCUIT_BREAKER_DEFAULTS } from "./circuit-breaker.mjs";
 import { selectValue, fallbackPickOptionByNumber, CancelledError } from "./cli-select.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -836,6 +837,51 @@ function describeCandidate(config, quad) {
   return [p.name, m?.name || m?.model || "?", b?.note || b?.url || "?", k?.note || k?.id || "?"].join(" · ");
 }
 
+// 熔断/TTFB 参数配置子流程。
+// current: 该 family 当前的 circuitBreaker 对象（null = 用全局默认）。
+// 返回 circuitBreaker 对象（null = 清除覆盖，用全局默认）。
+// 逐项询问，回车=保持当前值/全局默认，输入数字=覆盖；非法输入提示重试。
+async function editBreakerConfig(ask, current) {
+  const fields = [
+    { key: "ttfbTimeoutMs", label: "TTFB 超时", unit: "毫秒", hint: "首字节超时，大上下文冷缓存建议 30000+" },
+    { key: "failureThreshold", label: "失败阈值", unit: "次", hint: "连续失败几次后熔断" },
+    { key: "coolDownMs", label: "冷却时长", unit: "毫秒", hint: "熔断后多久尝试恢复" },
+    { key: "successThreshold", label: "恢复成功数", unit: "次", hint: "HALF_OPEN 连续成功几次后恢复" },
+  ];
+
+  const result = {};
+  console.log("\n--- 熔断/TTFB 配置 ---");
+  console.log("（每项回车=保持当前值；全部回车=清除 family 覆盖，用全局默认；输入 q 取消）");
+
+  for (const f of fields) {
+    const fallback = CIRCUIT_BREAKER_DEFAULTS[f.key];
+    const existing = (current && typeof current[f.key] === "number") ? current[f.key] : fallback;
+    while (true) {
+      const raw = await askCancelable(ask, `${f.label} [${f.unit}]（当前 ${existing}，默认 ${fallback}）${f.hint ? ` ${f.hint}` : ""}: `);
+      if (raw === "") {
+        // 空输入：用当前值
+        result[f.key] = existing;
+        break;
+      }
+      const num = Number(raw);
+      if (!Number.isFinite(num) || num <= 0) {
+        console.log(`  无效值「${raw}」，请输入正数或回车保持。`);
+        continue;
+      }
+      result[f.key] = num;
+      break;
+    }
+  }
+
+  // 判断结果是否和全局默认一致——一致就返回 null（不留无意义的覆盖）
+  const allDefault = fields.every((f) => result[f.key] === CIRCUIT_BREAKER_DEFAULTS[f.key]);
+  if (allDefault) {
+    console.log("（所有值与全局默认一致，不保留 family 覆盖）");
+    return null;
+  }
+  return result;
+}
+
 // 选 provider -> baseUrl -> key -> model，返回四元组或 null（取消）。
 async function pickCandidateQuad(ask, config) {
   const provider = await pickProvider(ask, config);
@@ -898,12 +944,17 @@ async function switchFamilyFlow(ask, pushLog) {
   let strategy = ["failover", "round_robin", "weighted"].includes(rawBinding.strategy)
     ? rawBinding.strategy
     : "failover";
+  // circuitBreaker 覆盖：编辑期间存本地变量，保存时随 PUT 一起提交。
+  let breakerConfig = rawBinding.circuitBreaker ?? null;
 
   const STRATEGY_OPTIONS = ["failover", "round_robin", "weighted"].map((s) => ({ label: s, value: s }));
 
   // 候选列表编辑子菜单
   while (true) {
-    console.log(`\n===== ${family} 候选列表（策略: ${strategy}）=====`);
+    const breakerLabel = breakerConfig
+      ? `TTFB ${breakerConfig.ttfbTimeoutMs ?? "?"}ms`
+      : "全局默认";
+    console.log(`\n===== ${family} 候选列表（策略: ${strategy} | 熔断: ${breakerLabel}）=====`);
     if (candidates.length === 0) {
       console.log("(空 —— 需追加候选)");
     }
@@ -916,6 +967,7 @@ async function switchFamilyFlow(ask, pushLog) {
       { label: "删除候选", value: "del" },
       { label: "设为主候选（置顶）", value: "promote" },
       { label: `切换策略（当前 ${strategy}）`, value: "strategy" },
+      { label: `熔断/TTFB 配置（当前 ${breakerLabel}）`, value: "breaker" },
       { label: "保存并返回", value: "save" },
       { label: "放弃返回", value: "cancel" },
     ]);
@@ -933,6 +985,10 @@ async function switchFamilyFlow(ask, pushLog) {
     if (action === "strategy") {
       const next = await pickOption(ask, "选择策略：", STRATEGY_OPTIONS);
       if (next) strategy = next;
+      continue;
+    }
+    if (action === "breaker") {
+      breakerConfig = await editBreakerConfig(ask, breakerConfig);
       continue;
     }
     if (candidates.length === 0) {
@@ -959,7 +1015,7 @@ async function switchFamilyFlow(ask, pushLog) {
 
   await api(`/families/${encodeURIComponent(family)}/candidates`, {
     method: "PUT",
-    body: { candidates, strategy },
+    body: { candidates, strategy, circuitBreaker: breakerConfig },
   });
   pushLog(`已保存 ${family}：${candidates.length} 个候选，策略 ${strategy}`);
 }

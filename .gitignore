@@ -5,6 +5,9 @@ data/gateway.json.tmp
 # 用量统计数据（含 provider/key 引用，不入库）
 data/usage-*.jsonl
 
+# 问题级调试日志（运行时生成，不入库）
+data/debug-*.log
+
 # 导出目录（本地临时文件）
 data/export/
 

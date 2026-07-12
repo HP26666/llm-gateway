@@ -7,8 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **TTFB 超时误杀大上下文请求**（阻断级体验问题）
+  - 默认 `DEFAULT_TTFB_TIMEOUT_MS` 15s → 30s：冷缓存 pre-fill（处理全部输入 token）常 >15s，旧值把正常的慢启动误判为"限额 hang"而误杀，导致熔断器在 HALF_OPEN↔CLOSED 间空转、两个 provider 都被切完返回 500
+  - 30s 覆盖绝大多数冷缓存场景；真 hang 时等待翻倍但配合熔断器（failureThreshold=3）仍可在合理时间内切换
+
+- **全候选 probe-fail 返回无意义错误**（bug 修复）
+  - 当所有候选都因 HALF_OPEN 探活失败被 `continue` 跳过时，`tryWithFailover` 的 `lastError` 保持 null，循环结束后抛出无意义的 `"tryWithFailover: no candidates and no error"`
+  - 修复：probe-fail 分支设置有意义的 `lastError`（`probe failed for <provider>:<model> (HALF_OPEN)`），客户端收到明确的错误信息而非迷惑性的兜底消息
+  - 配套测试（`test/probe-fail.test.mjs`）：全候选 probe-fail 场景回归，总测试 126→127 全绿
+
+- **连接失败快速 failover**（阻断级体验问题）
+  - provider 彻底挂掉（ECONNREFUSED/ENOTFOUND 等不可达错误）时，旧逻辑走 generic 重试 3 次（退避 1s/2s/4s ≈ 7.5s）才切副候选，且需 3 次独立请求才熔断——前 3 个请求每个卡 7.5s
+  - `fetchWithRetry` 新增连接失败快速分支：识别 `error.cause.code` ∈ {ECONNREFUSED,ECONNRESET,ENOTFOUND,ETIMEDOUT,EHOSTUNREACH,ENETUNREACH,EAI_*,ECONNABORTED}，不重试直接抛（~24ms vs 7.5s）
+  - `circuit-breaker.mjs` 新增 `forceOpen`：连接失败 1 次即熔断（非累计 failureThreshold 次），下一个请求 `orderCandidates` 直接跳过主候选
+  - 502/503/504/TTFB 超时等已有重试路径完全不受影响（仍走 generic 重试 + 累计计数）
+  - 配套测试 3 个（`test/fast-failover.test.mjs`）：连接失败 <500ms 切副 / 单次熔断第 2 请求跳过主 / 502 仍重试，总测试 123→126 全绿
+
 ### Added
-- （暂无）
+- **问题级日志自动持久化**（`debug-log.mjs`）
+  - failover / 熔断 / 上游异常 / 连接失败 / 流中断等"问题级"日志自动追加写到 `data/debug-YYYYMMDD.log`，不再依赖用户手动从 CLI `8=日志` 视图复制
+  - 在唯一日志出口 `emitLog` 处拦截 `[error]` / `[warn]` / `[failover]` / `[info][breaker]` 前缀，异步写文件（fire-and-forget，失败静默，不影响主请求路径）
+  - 按天分文件、保留 7 天、惰性清理（复用 usage-store 的成熟模式）
+  - 配套测试 5 个（`test/debug-log.test.mjs`）：前缀识别 / 写入 / 静默失败 / failover 集成，总测试 127→132 全绿
+- **CLI 候选编辑器新增"熔断/TTFB 配置"入口**（按键 5 → 候选编辑 → 熔断/TTFB 配置）
+  - 可逐项配置 per-family `ttfbTimeoutMs` / `failureThreshold` / `coolDownMs` / `successThreshold`，无需手改 JSON
+  - 全部回车=清除 family 覆盖（用全局默认）；配置值随 PUT 一起提交
+- **admin `PUT /admin/families/:family/candidates` 支持 `circuitBreaker` 字段**
+  - body 显式传 `circuitBreaker`（含 null=清除覆盖）即生效；不传时保持旧值回填（向后兼容）
+  - 清洗由 `normalizeCircuitBreaker` 自动完成（ttfbTimeoutMs clamp [1000,120000] 等）
+- 配套测试 6 个（`test/breaker-config.test.mjs`）：normalizeCircuitBreaker clamp + admin 端点端到端，总测试 117→123 全绿
 
 ## [3.3.0] - 2026-07-04
 
