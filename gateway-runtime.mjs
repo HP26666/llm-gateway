@@ -199,7 +199,11 @@ export function createGatewayRuntime({ config, requestHandler }) {
       });
       destroyTrackedSockets(oldServer, excludeSocket);
       if (!excludeSocket) {
-        const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 2000));
+        // unref：closePromise 先 resolve 时，timeout timer 不应阻塞事件循环退出。
+        const timeoutPromise = new Promise((resolve) => {
+          const t = setTimeout(resolve, 2000);
+          t.unref();
+        });
         await Promise.race([closePromise, timeoutPromise]);
       } else {
         closePromise.catch(() => {});

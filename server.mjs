@@ -20,7 +20,7 @@ import {
   recordBreakerSuccess,
 } from "./circuit-breaker.mjs";
 import { recordUsage } from "./usage-store.mjs";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   responsesBodyToAnthropic,
   resolveModelFromResponses,
@@ -286,6 +286,11 @@ export async function fetchWithRetry(url, options, route = null, { breakerNotify
   throw lastError ?? new Error("fetchWithRetry exhausted all budgets");
 }
 
+// 按 model 字段判定 family。关键字匹配（includes）覆盖 Anthropic 新老两种命名：
+//   新：claude-sonnet-4-5 / claude-opus-4-1 / claude-haiku-3-5
+//   旧：claude-3-5-sonnet-20241022 / claude-3-opus-20240229 / claude-3-haiku-20240307
+// 旧式正则 ^claude-sonnet-[0-9-]+$ 漏掉"sonnet 在版本号中间"的老格式，静默兜底到 opus。
+// [1m] 后缀单独识别：sonnet 带 [1m] → sonnet[1m]（独立 1M 上下文 family）。
 function detectModelFamily(requestedModel) {
   const normalized = String(requestedModel ?? "").trim().toLowerCase();
 
@@ -304,16 +309,18 @@ function detectModelFamily(requestedModel) {
   if (normalized === "haiku") {
     return "haiku";
   }
-  if (/^claude-opus-[0-9-]+(?:\[1m\])?$/.test(normalized)) {
+
+  // [1m] 后缀判定（仅 sonnet 有独立 1m family；opus/haiku 带 [1m] 也按主 family 归类）
+  const has1m = /\[1m\]$/.test(normalized);
+
+  // 关键字匹配：顺序 opus > sonnet > haiku（三者互斥，Anthropic 不会同时含两个关键字）
+  if (normalized.includes("sonnet")) {
+    return has1m ? "sonnet[1m]" : "sonnet";
+  }
+  if (normalized.includes("opus")) {
     return "opus";
   }
-  if (/^claude-sonnet-[0-9-]+\[1m\]$/.test(normalized)) {
-    return "sonnet[1m]";
-  }
-  if (/^claude-sonnet-[0-9-]+$/.test(normalized)) {
-    return "sonnet";
-  }
-  if (/^claude-haiku-[0-9-]+$/.test(normalized)) {
+  if (normalized.includes("haiku")) {
     return "haiku";
   }
 
@@ -1138,13 +1145,24 @@ async function handleResponsesProxy(config, metrics, req, res, pathname) {
   });
 }
 
+// 常量时间字符串比较，避免 token 校验的 timing 侧信道（与 admin.mjs safeEqual 对齐）。
+function safeEqualString(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) {
+    return false;
+  }
+  return timingSafeEqual(ab, bb);
+}
+
 function checkGatewayAuth(config, req, res) {
   if (!config.gateway.sharedToken) {
     return true;
   }
 
   const expected = `Bearer ${config.gateway.sharedToken}`;
-  if (req.headers.authorization !== expected) {
+  // 常量时间比较（非常量时间 ===），防 token 长度/前缀侧信道。
+  if (!safeEqualString(req.headers.authorization, expected)) {
     writeJson(res, 401, {
       error: {
         type: "authentication_error",
